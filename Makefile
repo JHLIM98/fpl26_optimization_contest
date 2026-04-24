@@ -89,14 +89,16 @@ help:
 	@echo "  VIVADO_EXEC     - Path to Vivado executable (default: vivado)"
 	@echo "  JAVA_HOME       - Java installation directory (auto-detected from PATH if not set)"
 	@echo "  DCP             - Input DCP file for run_optimizer / run_test targets"
+	@echo "  OUTPUT          - Optional output DCP path"
+	@echo "  RUN_DIR         - Optional run directory for logs and intermediate files"
 	@echo "  MAX_NETS        - Max high fanout nets to optimize in test mode (default: 5)"
 	@echo "  GOLDEN          - Golden (reference) DCP for validation"
 	@echo "  REVISED         - Revised (optimized) DCP for validation"
 	@echo "  VECTORS         - Number of test vectors for validation (default: 10000)"
 	@echo ""
 	@echo "Output structure:"
-	@echo "  - Optimized DCP: <input_name>_optimized-<timestamp>.dcp (next to input)"
-	@echo "  - Run directory: dcp_optimizer_run-<timestamp>/ (contains all logs)"
+	@echo "  - Optimized DCP: <input_name>_optimized-<timestamp>.dcp (next to input, or OUTPUT if set)"
+	@echo "  - Run directory: dcp_optimizer_run-<timestamp>/ (or RUN_DIR if set)"
 	@echo "  - Validation:    /tmp/dcp_validation_*/ (contains simulation logs)"
 
 # Setup target: Install dependencies, check Vivado, set up Java, build RapidWright, download DCPs
@@ -240,7 +242,7 @@ run_optimizer:
 		fi; \
 	fi; \
 	echo ""; \
-	$(PYTHON) dcp_optimizer.py "$(DCP)" 
+	$(PYTHON) dcp_optimizer.py "$(DCP)" $(if $(OUTPUT),--output "$(OUTPUT)") $(if $(RUN_DIR),--run-dir "$(RUN_DIR)")
 
 # Run test mode: Run dcp_optimizer.py with --test flag (no LLM required)
 run_test:
@@ -275,7 +277,7 @@ run_test:
 		fi; \
 	fi; \
 	echo ""; \
-	$(PYTHON) dcp_optimizer.py "$(DCP)" --test $(if $(MAX_NETS),--max-nets $(MAX_NETS))
+	$(PYTHON) dcp_optimizer.py "$(DCP)" $(if $(OUTPUT),--output "$(OUTPUT)") $(if $(RUN_DIR),--run-dir "$(RUN_DIR)") --test $(if $(MAX_NETS),--max-nets $(MAX_NETS))
 
 # Validation target: Validate functional equivalence between two DCPs
 validate:

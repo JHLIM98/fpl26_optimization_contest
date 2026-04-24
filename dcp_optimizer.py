@@ -2344,6 +2344,11 @@ Examples:
         default=5,
         help="Maximum number of high fanout nets to optimize in test mode (default: 5)"
     )
+    parser.add_argument(
+        "--run-dir",
+        type=Path,
+        help="Directory for logs, journals, and intermediate files. Default: dcp_optimizer_run-<timestamp> in current directory"
+    )
     
     args = parser.parse_args()
     
@@ -2367,15 +2372,17 @@ Examples:
     
     # Test mode - run without LLM
     if args.test:
-        # Create run directory with timestamp
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        run_dir = Path.cwd() / f"dcp_optimizer_run-{timestamp}"
+        if args.run_dir is None:
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            run_dir = Path.cwd() / f"dcp_optimizer_run-{timestamp}"
+        else:
+            run_dir = args.run_dir
         
         print(f"FPGA Design Optimization - TEST MODE")
         print(f"=====================================")
         print(f"Input:       {args.input_dcp.resolve()}")
         print(f"Output:      {args.output_dcp.resolve()}")
-        print(f"Run dir:     {run_dir}")
+        print(f"Run dir:     {run_dir.resolve()}")
         print(f"Max nets to optimize: {args.max_nets}")
         print()
         
@@ -2398,15 +2405,17 @@ Examples:
         print("Error: openai package not installed. Run: pip install openai", file=sys.stderr)
         sys.exit(1)
     
-    # Create run directory with timestamp (before creating optimizer so we can show it)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    run_dir = Path.cwd() / f"dcp_optimizer_run-{timestamp}"
+    if args.run_dir is None:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        run_dir = Path.cwd() / f"dcp_optimizer_run-{timestamp}"
+    else:
+        run_dir = args.run_dir
     
     print(f"FPGA Design Optimization Agent")
     print(f"================================")
     print(f"Input:       {args.input_dcp.resolve()}")
     print(f"Output:      {args.output_dcp.resolve()}")
-    print(f"Run dir:     {run_dir}")
+    print(f"Run dir:     {run_dir.resolve()}")
     print(f"Model:       {args.model}")
     print()
     
