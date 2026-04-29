@@ -65,6 +65,42 @@ class DCPValidator:
         self.phase2_skip_reason = None
         self.structural_report = None
         self.simulation_report = None
+
+    def _resolve_vivado_tool(self, tool_name: str) -> str:
+        """
+        Resolve a Vivado companion executable in a submission-friendly way.
+
+        Prefer the directory containing VIVADO_EXEC so the repo works without
+        requiring users to source settings64.sh manually. Fall back to PATH.
+        """
+        vivado_exec = os.environ.get("VIVADO_EXEC")
+        candidate_paths = []
+
+        if vivado_exec:
+            vivado_exec_path = Path(vivado_exec).expanduser()
+            if vivado_exec_path.parent.name == "bin":
+                candidate_paths.append(vivado_exec_path.parent / tool_name)
+            elif vivado_exec_path.name == "vivado":
+                candidate_paths.append(vivado_exec_path.with_name(tool_name))
+
+        for candidate in candidate_paths:
+            if candidate.exists() and os.access(candidate, os.X_OK):
+                return str(candidate.resolve())
+
+        resolved = shutil.which(tool_name)
+        if resolved:
+            return resolved
+
+        if vivado_exec:
+            raise FileNotFoundError(
+                f"Could not find '{tool_name}'. Checked VIVADO_EXEC sibling paths derived from "
+                f"'{vivado_exec}' and PATH."
+            )
+
+        raise FileNotFoundError(
+            f"Could not find '{tool_name}' on PATH. Set VIVADO_EXEC to the Vivado binary or "
+            "add Vivado/bin to PATH."
+        )
     
     async def start_servers(self):
         """Start both MCP servers."""
@@ -652,10 +688,14 @@ endmodule
             with open(revised_renamed, 'w') as f:
                 f.write(content)
             
+            xvlog_exec = self._resolve_vivado_tool("xvlog")
+            xelab_exec = self._resolve_vivado_tool("xelab")
+            xsim_exec = self._resolve_vivado_tool("xsim")
+
             # Compile Verilog files
             logger.info("Compiling with xvlog...")
             compile_cmd = [
-                "xvlog",
+                xvlog_exec,
                 "-work", "work",
                 str(golden_v),
                 str(revised_renamed),
@@ -687,7 +727,7 @@ endmodule
             # Elaborate with UNISIM library reference
             logger.info("Elaborating with xelab...")
             elab_cmd = [
-                "xelab",
+                xelab_exec,
                 "-debug", "typical",
                 "-L", "unisims_ver",  # Link against UNISIM library
                 "-L", "unimacro_ver",
@@ -735,7 +775,7 @@ endmodule
             print(f"\nSimulating {self.num_vectors} test vectors...")
             
             sim_cmd = [
-                "xsim",
+                xsim_exec,
                 "testbench_sim",
                 "-R"
             ]
