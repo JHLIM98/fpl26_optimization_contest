@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+DEFAULT_DCP_REL="fpl26_contest_benchmarks/logicnets_jscl_2025.1.dcp"
+RESULT_DIR="${PROJECT_ROOT}/outputs/result"
+LOG_DIR="${PROJECT_ROOT}/outputs/log"
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+INPUT_STEM="$(basename "${DEFAULT_DCP_REL}" .dcp)"
+OUTPUT_DCP="${RESULT_DIR}/${INPUT_STEM}_optimized-${TIMESTAMP}.dcp"
+RUN_DIR="${LOG_DIR}/dcp_optimizer_run-${TIMESTAMP}"
+
+if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+    echo "Error: OPENROUTER_API_KEY is not set" >&2
+    echo "       export OPENROUTER_API_KEY=<your key> before running this script." >&2
+    exit 1
+fi
+
+mkdir -p "${RESULT_DIR}" "${LOG_DIR}"
+
+echo "Running LLM-guided optimizer"
+echo "  Input:  ${PROJECT_ROOT}/${DEFAULT_DCP_REL}"
+echo "  Output: ${OUTPUT_DCP}"
+echo "  Log:    ${RUN_DIR}"
+echo
+
+cd "${PROJECT_ROOT}"
+exec make run_optimizer DCP="${DEFAULT_DCP_REL}" OUTPUT="${OUTPUT_DCP}" RUN_DIR="${RUN_DIR}"
