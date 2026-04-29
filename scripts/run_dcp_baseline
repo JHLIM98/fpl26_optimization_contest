@@ -1,24 +1,113 @@
 #!/usr/bin/env bash
+#
+# Run the deterministic baseline optimizer.
+#
+# Modes:
+#   scripts/run_dcp_baseline                  Run the canonical example DCP
+#   scripts/run_dcp_baseline <dcp_path>       Run on a specific DCP
+#   scripts/run_dcp_baseline --all            Run on every DCP in fpl26_contest_benchmarks/
+#                                             (sorted by size ascending) and write a TSV summary
+#
+# Output layout (always under outputs/):
+#   outputs/result/<stem>_optimized-<ts>.dcp
+#   outputs/log/<stem>-<ts>/                  optimizer run dir (logs, journals, intermediates)
+#   outputs/log/<stem>-<ts>.log               optimizer stdout/stderr (only --all mode)
+#   outputs/baseline_sweep_summary.tsv        summary table (only --all mode)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-DEFAULT_DCP_REL="fpl26_contest_benchmarks/logicnets_jscl_2025.1.dcp"
+BENCH_DIR_REL="fpl26_contest_benchmarks"
+DEFAULT_DCP_REL="${BENCH_DIR_REL}/logicnets_jscl_2025.1.dcp"
 RESULT_DIR="${PROJECT_ROOT}/outputs/result"
 LOG_DIR="${PROJECT_ROOT}/outputs/log"
-TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-INPUT_STEM="$(basename "${DEFAULT_DCP_REL}" .dcp)"
-OUTPUT_DCP="${RESULT_DIR}/${INPUT_STEM}_optimized-${TIMESTAMP}.dcp"
-RUN_DIR="${LOG_DIR}/dcp_optimizer_run-${TIMESTAMP}"
+SUMMARY="${PROJECT_ROOT}/outputs/baseline_sweep_summary.tsv"
 
 mkdir -p "${RESULT_DIR}" "${LOG_DIR}"
 
-echo "Running deterministic baseline optimizer"
-echo "  Input:  ${PROJECT_ROOT}/${DEFAULT_DCP_REL}"
-echo "  Output: ${OUTPUT_DCP}"
-echo "  Log:    ${RUN_DIR}"
-echo
-
 cd "${PROJECT_ROOT}"
-exec make run_baseline DCP="${DEFAULT_DCP_REL}" OUTPUT="${OUTPUT_DCP}" RUN_DIR="${RUN_DIR}"
+
+usage() {
+    sed -n '3,12p' "${BASH_SOURCE[0]}" | sed 's/^#//'
+}
+
+# Run baseline on a single DCP. In --all mode we capture stdout/stderr to a per-DCP
+# log file and append a row to the summary TSV; in single-DCP modes we stream the
+# Make output directly so the user sees progress live.
+run_one() {
+    local dcp_path="$1"
+    local capture="${2:-no}"   # "yes" -> redirect to log file and append to summary
+    local dcp_name; dcp_name="$(basename "${dcp_path}")"
+    local stem="${dcp_name%.dcp}"
+    local timestamp; timestamp="$(date +%Y%m%d_%H%M%S)"
+    local output_dcp="${RESULT_DIR}/${stem}_optimized-${timestamp}.dcp"
+    local run_dir="${LOG_DIR}/${stem}-${timestamp}"
+
+    echo "----- BASELINE: ${dcp_name} -----"
+    echo "  Input:   ${dcp_path}"
+    echo "  Output:  ${output_dcp}"
+    echo "  Run dir: ${run_dir}"
+
+    local start end runtime status
+    start=$(date +%s)
+    if [ "${capture}" = "yes" ]; then
+        local log_file="${LOG_DIR}/${stem}-${timestamp}.log"
+        echo "  Log:     ${log_file}"
+        if make run_baseline DCP="${dcp_path}" OUTPUT="${output_dcp}" RUN_DIR="${run_dir}" \
+                > "${log_file}" 2>&1; then
+            status="OK"
+        else
+            status="FAIL"
+        fi
+
+        local initial final delta
+        initial="$(grep -oP 'Initial Fmax:\s+\K[\d.]+' "${log_file}" | head -1 || true)"
+        final="$(grep -oP 'Final Fmax:\s+\K[\d.]+'   "${log_file}" | head -1 || true)"
+        delta="$(grep -oP 'Fmax Improvement:\s+\+?\K-?[\d.]+' "${log_file}" | head -1 || true)"
+        end=$(date +%s); runtime=$((end - start))
+
+        printf "%s\t%s\t%s\t%s\t%s\t%d\n" \
+               "${dcp_name}" "${status}" "${initial:-N/A}" "${final:-N/A}" "${delta:-N/A}" "${runtime}" \
+               >> "${SUMMARY}"
+        echo "  ${status}  initial=${initial:-N/A}  final=${final:-N/A}  delta=${delta:-N/A} MHz  runtime=${runtime}s"
+        echo
+    else
+        echo
+        exec make run_baseline DCP="${dcp_path}" OUTPUT="${output_dcp}" RUN_DIR="${run_dir}"
+    fi
+}
+
+case "${1:-}" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    --all)
+        echo "Sweep mode: ALL DCPs under ${BENCH_DIR_REL}/"
+        printf "DCP\tSTATUS\tINITIAL_FMAX\tFINAL_FMAX\tDELTA_MHZ\tRUNTIME_S\n" > "${SUMMARY}"
+        # Skip already-optimized files (e.g. leftover *_optimized-*.dcp), sort by size ascending
+        mapfile -t DCPS < <(
+            find "${BENCH_DIR_REL}" -maxdepth 1 -type f -name "*.dcp" ! -name "*_optimized*" \
+                 -printf "%s\t%P\n" | sort -n | awk -F'\t' '{print $2}'
+        )
+        echo "Found ${#DCPS[@]} DCPs (sorted smallest first)"
+        echo "Summary will be written to: ${SUMMARY}"
+        echo
+        for d in "${DCPS[@]}"; do
+            run_one "${BENCH_DIR_REL}/${d}" yes
+        done
+        echo "===== SWEEP COMPLETE ====="
+        if command -v column >/dev/null 2>&1; then
+            column -t -s $'\t' "${SUMMARY}"
+        else
+            cat "${SUMMARY}"
+        fi
+        ;;
+    "")
+        run_one "${DEFAULT_DCP_REL}" no
+        ;;
+    *)
+        run_one "$1" no
+        ;;
+esac

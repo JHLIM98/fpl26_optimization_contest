@@ -42,19 +42,24 @@ logger = logging.getLogger(__name__)
 class DCPValidator:
     """Validates functional equivalence between two DCPs."""
     
-    def __init__(self, golden_dcp: Path, revised_dcp: Path, num_vectors: int = 10000, debug: bool = False):
+    def __init__(self, golden_dcp: Path, revised_dcp: Path, num_vectors: int = 10000, debug: bool = False, work_dir: Optional[Path] = None):
         self.golden_dcp = golden_dcp
         self.revised_dcp = revised_dcp
         self.num_vectors = num_vectors
         self.debug = debug
-        
+
         self.exit_stack = AsyncExitStack()
         self.rapidwright_session: Optional[ClientSession] = None
         self.vivado_session: Optional[ClientSession] = None
-        
-        # Create temporary directory for intermediate files in workspace
-        # (avoids /tmp running out of space for large designs)
-        workspace_dir = Path(__file__).parent
+
+        # Working directory for intermediate files. If --work-dir not given,
+        # default under outputs/validation/ in the repo (avoids /tmp running out
+        # of space for large designs while keeping the repo root clean).
+        if work_dir is None:
+            workspace_dir = Path(__file__).parent / "outputs" / "validation"
+        else:
+            workspace_dir = work_dir
+        workspace_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir = Path(tempfile.mkdtemp(prefix="dcp_validation_", dir=workspace_dir))
         logger.info(f"Working directory: {self.temp_dir}")
         
@@ -968,7 +973,14 @@ Examples:
         action="store_true",
         help="Enable debug logging"
     )
-    
+    parser.add_argument(
+        "--work-dir",
+        type=Path,
+        default=None,
+        help="Parent directory for the dcp_validation_<random>/ workspace. "
+             "Default: outputs/validation/ in the repo."
+    )
+
     args = parser.parse_args()
     
     # Validate inputs
@@ -988,7 +1000,8 @@ Examples:
         golden_dcp=args.golden_dcp,
         revised_dcp=args.revised_dcp,
         num_vectors=args.vectors,
-        debug=args.debug
+        debug=args.debug,
+        work_dir=args.work_dir,
     )
     
     try:

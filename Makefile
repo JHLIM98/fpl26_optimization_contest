@@ -97,6 +97,7 @@ help:
 	@echo "  GOLDEN          - Golden (reference) DCP for validation"
 	@echo "  REVISED         - Revised (optimized) DCP for validation"
 	@echo "  VECTORS         - Number of test vectors for validation (default: 10000)"
+	@echo "  WORK_DIR        - Optional parent dir for validation workspace (default: outputs/validation)"
 	@echo ""
 	@echo "Output structure:"
 	@echo "  - Optimized DCP: <input_name>_optimized-<timestamp>.dcp (next to input, or OUTPUT if set)"
@@ -349,11 +350,7 @@ validate:
 	@printf "$(COLOR_GREEN)Revised DCP:$(COLOR_RESET) $(REVISED)\n"
 	@printf "$(COLOR_GREEN)Test Vectors:$(COLOR_RESET) $(or $(VECTORS),10000)\n"
 	@echo ""
-	@if [ -n "$(VECTORS)" ]; then \
-		$(PYTHON) validate_dcps.py "$(GOLDEN)" "$(REVISED)" --vectors $(VECTORS); \
-	else \
-		$(PYTHON) validate_dcps.py "$(GOLDEN)" "$(REVISED)"; \
-	fi
+	$(PYTHON) validate_dcps.py "$(GOLDEN)" "$(REVISED)" $(if $(VECTORS),--vectors $(VECTORS)) $(if $(WORK_DIR),--work-dir "$(WORK_DIR)")
 
 # Quick validation example using demo DCPs
 validate_demo:
