@@ -1510,7 +1510,7 @@ class FPGAOptimizerTest(DCPOptimizerBase):
         self,
         nets_report: str,
         max_nets: int,
-        min_fanout: int = 150
+        min_fanout: int = 100
     ) -> list[tuple[str, int, int]]:
         """
         Pick a small number of high-value fanout candidates for the general baseline.
@@ -1660,14 +1660,14 @@ class FPGAOptimizerTest(DCPOptimizerBase):
             print("-"*60)
             nets_report = await self.call_vivado_tool("get_critical_high_fanout_nets", {
                 "num_paths": 30,
-                "min_fanout": 120,
+                "min_fanout": 80,
                 "exclude_clocks": True
             }, timeout=600.0)
             logger.info(f"High fanout nets report: {nets_report}")
             fanout_candidates = self._select_general_fanout_candidates(
                 nets_report,
                 max_nets=max_nets_to_optimize,
-                min_fanout=150
+                min_fanout=100
             )
 
             if fanout_candidates:
@@ -2781,8 +2781,11 @@ Examples:
 
     # Deterministic baseline mode - benchmark agnostic, no LLM required
     if args.baseline:
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        run_dir = Path.cwd() / f"dcp_optimizer_run-{timestamp}"
+        if args.run_dir is None:
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            run_dir = Path.cwd() / f"dcp_optimizer_run-{timestamp}"
+        else:
+            run_dir = args.run_dir
 
         print(f"FPGA Design Optimization - DETERMINISTIC BASELINE MODE")
         print(f"========================================================")
