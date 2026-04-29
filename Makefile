@@ -58,7 +58,7 @@ COLOR_RED := \033[0;31m
 COLOR_BLUE := \033[0;34m
 COLOR_RESET := \033[0m
 
-.PHONY: setup build-rapidwright run_optimizer run_test run_baseline validate validate_demo run-submission clean veryclean help
+.PHONY: setup build-rapidwright run_optimizer run_test run_baseline run_strategy validate validate_demo run-submission clean veryclean help
 
 # Default target
 help:
@@ -70,6 +70,7 @@ help:
 	@echo "  run_optimizer      - Run optimizer on a DCP file (LLM-guided, requires API key)"
 	@echo "  run_test           - Run optimizer in test mode (no LLM, hardcoded optimization)"
 	@echo "  run_baseline       - Run deterministic fallback baseline on a DCP file (no LLM)"
+	@echo "  run_strategy       - Run a single named optimization strategy in isolation (e.g. STRATEGY=replace)"
 	@echo "  validate           - Validate functional equivalence between two DCPs"
 	@echo "  validate_demo      - Run validation demo (self-check)"
 	@echo "  clean              - Remove generated files (run directories, logs, Vivado outputs)"
@@ -90,7 +91,8 @@ help:
 	@echo "Environment variables:"
 	@echo "  VIVADO_EXEC     - Path to Vivado executable (default: vivado)"
 	@echo "  JAVA_HOME       - Java installation directory (auto-detected from PATH if not set)"
-	@echo "  DCP             - Input DCP file for run_optimizer / run_test / run_baseline targets"
+	@echo "  DCP             - Input DCP file for run_optimizer / run_test / run_baseline / run_strategy targets"
+	@echo "  STRATEGY        - Strategy name for run_strategy target (e.g. 'replace')"
 	@echo "  OUTPUT          - Optional output DCP path"
 	@echo "  RUN_DIR         - Optional run directory for logs and intermediate files"
 	@echo "  MAX_NETS        - Max high fanout nets to optimize in non-LLM modes (default: 5)"
@@ -312,6 +314,43 @@ run_baseline:
 	fi; \
 	echo ""; \
 	$(PYTHON) dcp_optimizer.py "$(DCP)" $(if $(OUTPUT),--output "$(OUTPUT)") $(if $(RUN_DIR),--run-dir "$(RUN_DIR)") --baseline $(if $(MAX_NETS),--max-nets $(MAX_NETS))
+
+# Run a single named optimization strategy in isolation (no LLM).
+# Currently supported: STRATEGY=replace (RapidWright cell re-placement).
+run_strategy:
+	@if [ -z "$(DCP)" ]; then \
+		printf "$(COLOR_RED)Error: DCP variable not set$(COLOR_RESET)\n"; \
+		echo "Usage: make run_strategy DCP=input.dcp STRATEGY=replace [OUTPUT=...] [RUN_DIR=...]"; \
+		exit 1; \
+	fi
+	@if [ ! -f "$(DCP)" ]; then \
+		printf "$(COLOR_RED)Error: DCP file not found: $(DCP)$(COLOR_RESET)\n"; \
+		exit 1; \
+	fi
+	@if [ -z "$(STRATEGY)" ]; then \
+		printf "$(COLOR_RED)Error: STRATEGY variable not set$(COLOR_RESET)\n"; \
+		echo "Usage: make run_strategy DCP=input.dcp STRATEGY=replace"; \
+		exit 1; \
+	fi
+	@printf "$(COLOR_GREEN)Running strategy '$(STRATEGY)' on $(DCP)...$(COLOR_RESET)\n"
+	@# Set up Java from Vivado if Java is not available
+	@if ! command -v java >/dev/null 2>&1; then \
+		printf "$(COLOR_YELLOW)Java not found on PATH, attempting to use Java from Vivado...$(COLOR_RESET)\n"; \
+		VIVADO_PATH=$$(command -v $(VIVADO_EXEC) 2>/dev/null); \
+		if [ -n "$$VIVADO_PATH" ]; then \
+			VIVADO_BIN_DIR=$$(dirname $$VIVADO_PATH); \
+			VIVADO_ROOT=$$(dirname $$VIVADO_BIN_DIR); \
+			VIVADO_JAVA="$$VIVADO_ROOT/tps/lnx64/jre11*/bin/java"; \
+			if ls $$VIVADO_JAVA >/dev/null 2>&1; then \
+				JAVA_FOUND=$$(ls $$VIVADO_JAVA | head -n 1); \
+				export JAVA_HOME=$$(dirname $$(dirname $$JAVA_FOUND)); \
+				export PATH="$$JAVA_HOME/bin:$$PATH"; \
+				printf "$(COLOR_GREEN)Using Java from Vivado: %s$(COLOR_RESET)\n" "$$JAVA_HOME"; \
+			fi; \
+		fi; \
+	fi; \
+	echo ""; \
+	$(PYTHON) dcp_optimizer.py "$(DCP)" $(if $(OUTPUT),--output "$(OUTPUT)") $(if $(RUN_DIR),--run-dir "$(RUN_DIR)") --strategy $(STRATEGY)
 
 # Validation target: Validate functional equivalence between two DCPs
 validate:

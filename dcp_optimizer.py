@@ -1835,6 +1835,153 @@ class FPGAOptimizerTest(DCPOptimizerBase):
             print(f"Exception: {type(e).__name__}: {e}")
             return False
 
+    async def try_cell_replacement(
+        self,
+        input_dcp: Path,
+        output_dcp: Path,
+        detour_threshold: float = 2.0,
+        target_paths_max: int = 2,
+        extract_num_paths: int = 10,
+    ) -> dict:
+        """Benchmark-agnostic cell re-placement using RapidWright detour analysis.
+
+        Mirrors run_test_vexriscv but returns structured stats so callers
+        (matrix sweep, baseline dispatcher) can decide what to do with the
+        result. Assumes start_servers() has already been called.
+
+        Flow:
+          1. Vivado: open input + measure baseline + extract critical path pins
+          2. RapidWright: read DCP + analyze_net_detour
+          3. RapidWright: optimize_cell_placement on detour candidates + write
+          4. Vivado: open optimized DCP + route_design + measure final timing
+        """
+        notes: list[str] = []
+        stats = {
+            "success": False,
+            "initial_wns": None,
+            "final_wns": None,
+            "clock_period": None,
+            "candidates_found": 0,
+            "cells_replaced": [],
+            "routing_errors": -1,
+            "notes": notes,
+        }
+
+        try:
+            # Step 1: Vivado baseline + extract critical path pins
+            await self.call_vivado_tool("open_checkpoint", {
+                "dcp_path": str(input_dcp.resolve())
+            }, timeout=600.0)
+
+            self.clock_period = await self.fetch_clock_period()
+            target_wns = await self.get_wns_for_target_clock(self._call_vivado_for_clock)
+            if target_wns is not None:
+                self.initial_wns = target_wns
+            else:
+                ts = await self.call_vivado_tool("report_timing_summary", {}, timeout=300.0)
+                self.initial_wns = self.parse_wns_from_timing_report(ts)
+            stats["initial_wns"] = self.initial_wns
+            stats["clock_period"] = self.clock_period
+
+            pins_file = Path(self.temp_dir) / "critical_path_pins.json"
+            extract_result = await self.call_vivado_tool("extract_critical_path_pins", {
+                "num_paths": extract_num_paths,
+                "output_file": str(pins_file)
+            }, timeout=600.0)
+            critical_paths = (
+                json.loads(Path(pins_file).read_text())
+                if pins_file.exists()
+                else json.loads(extract_result)
+            )
+            notes.append(f"Extracted {len(critical_paths)} critical path pin lists")
+
+            # Step 2: RapidWright detour analysis
+            await self.call_rapidwright_tool("initialize_rapidwright", {
+                "jvm_max_memory": "8G"
+            }, timeout=120.0)
+            await self.call_rapidwright_tool("read_checkpoint", {
+                "dcp_path": str(input_dcp.resolve())
+            }, timeout=600.0)
+
+            analyze_result = await self.call_rapidwright_tool("analyze_net_detour", {
+                "input_file": str(pins_file),
+                "detour_threshold": detour_threshold
+            }, timeout=300.0)
+            analysis = (
+                json.loads(analyze_result)
+                if isinstance(analyze_result, str)
+                else analyze_result
+            )
+            if "error" in analysis:
+                notes.append(f"analyze_net_detour error: {analysis['error']}")
+                return stats
+
+            candidates = analysis.get("candidates", [])
+            stats["candidates_found"] = len(candidates)
+            notes.append(
+                f"Detour analysis: {analysis.get('cells_analyzed', '?')} cells inspected, "
+                f"{len(candidates)} above threshold {detour_threshold}"
+            )
+
+            if not candidates:
+                # Nothing to re-place; treat as a success but produce no output
+                stats["final_wns"] = self.initial_wns
+                stats["success"] = True
+                notes.append("No detour candidates above threshold - re-placement skipped")
+                return stats
+
+            worst_path_cells = list(set(
+                str(c["cell"]) for c in candidates
+                if c.get("path", 0) <= target_paths_max
+            ))
+            if not worst_path_cells:
+                worst_path_cells = [str(candidates[0]["cell"])]
+            stats["cells_replaced"] = worst_path_cells
+            notes.append(f"Targeting {len(worst_path_cells)} cells on paths 1-{target_paths_max}")
+
+            # Step 3: RapidWright optimize_cell_placement + write intermediate DCP
+            await self.call_rapidwright_tool("optimize_cell_placement", {
+                "cell_names": worst_path_cells
+            }, timeout=300.0)
+
+            rw_intermediate = Path(self.temp_dir) / "cell_replaced_intermediate.dcp"
+            await self.call_rapidwright_tool("write_checkpoint", {
+                "dcp_path": str(rw_intermediate)
+            }, timeout=600.0)
+
+            # Step 4: Vivado route + measure final + write output DCP
+            await self.call_vivado_tool("open_checkpoint", {
+                "dcp_path": str(rw_intermediate)
+            }, timeout=600.0)
+            await self.call_vivado_tool("route_design", {
+                "directive": "Default"
+            }, timeout=3600.0)
+
+            route_status = await self.call_vivado_tool("report_route_status", {}, timeout=300.0)
+            error_match = re.search(r"# of nets with routing errors.*?:\s+(\d+)", route_status)
+            stats["routing_errors"] = int(error_match.group(1)) if error_match else -1
+
+            target_wns = await self.get_wns_for_target_clock(self._call_vivado_for_clock)
+            if target_wns is not None:
+                self.final_wns = target_wns
+            else:
+                ts = await self.call_vivado_tool("report_timing_summary", {}, timeout=300.0)
+                self.final_wns = self.parse_wns_from_timing_report(ts)
+            stats["final_wns"] = self.final_wns
+
+            await self.call_vivado_tool("write_checkpoint", {
+                "dcp_path": str(output_dcp.resolve()),
+                "force": True
+            }, timeout=600.0)
+
+            stats["success"] = True
+            return stats
+
+        except Exception as e:
+            logger.exception(f"try_cell_replacement failed: {e}")
+            notes.append(f"Exception: {type(e).__name__}: {e}")
+            return stats
+
     async def run_test(self, input_dcp: Path, output_dcp: Path, max_nets_to_optimize: int = 5) -> bool:
         """
         Run the deterministic test optimization flow.
@@ -2672,6 +2819,53 @@ async def run_baseline_mode(
         await tester.cleanup()
 
 
+async def run_replace_mode(
+    input_dcp: Path,
+    output_dcp: Path,
+    debug: bool = False,
+    run_dir: Optional[Path] = None,
+):
+    """Run the cell re-placement strategy in isolation (RapidWright detour + centroid + reroute)."""
+    tester = FPGAOptimizerTest(debug=debug, run_dir=run_dir)
+
+    try:
+        await tester.start_servers()
+        stats = await tester.try_cell_replacement(input_dcp, output_dcp)
+
+        for note in stats["notes"]:
+            print(f"[REPLACE] {note}")
+
+        if stats["success"]:
+            initial = stats["initial_wns"]
+            final = stats["final_wns"]
+            cells = stats["cells_replaced"]
+            errors = stats["routing_errors"]
+            print("\n[REPLACE] Cell re-placement completed successfully")
+            print(f"[REPLACE]   Initial WNS:    {initial}")
+            print(f"[REPLACE]   Final WNS:      {final}")
+            print(f"[REPLACE]   Cells replaced: {len(cells)}")
+            print(f"[REPLACE]   Routing errors: {errors}")
+            print(f"[REPLACE]   Output DCP:     {output_dcp}")
+            print(f"[REPLACE]   Run directory:  {tester.run_dir}")
+            return 0
+
+        print("\n[REPLACE] Cell re-placement failed")
+        print(f"[REPLACE] Run directory: {tester.run_dir}")
+        return 1
+
+    except KeyboardInterrupt:
+        print("\n[REPLACE] Interrupted by user")
+        print(f"[REPLACE] Run directory: {tester.run_dir}")
+        return 130
+    except Exception as e:
+        logger.exception(f"Replace mode fatal error: {e}")
+        print(f"\n[REPLACE] Fatal error: {e}")
+        print(f"[REPLACE] Run directory: {tester.run_dir}")
+        return 1
+    finally:
+        await tester.cleanup()
+
+
 async def main():
     parser = argparse.ArgumentParser(
         description="FPGA Design Optimization Agent",
@@ -2723,6 +2917,14 @@ Examples:
         help="Deterministic fallback mode: run a benchmark-agnostic non-LLM baseline using limited fanout optimization and phys_opt."
     )
     parser.add_argument(
+        "--strategy",
+        choices=["replace"],
+        default=None,
+        help="Run a single benchmark-agnostic strategy in isolation (no LLM). "
+             "'replace' = RapidWright cell re-placement (detour analysis + centroid placement + reroute). "
+             "More strategies (pblock, fanout, phys_opt) will be added."
+    )
+    parser.add_argument(
         "--max-nets",
         type=int,
         default=5,
@@ -2753,6 +2955,11 @@ Examples:
     
     # Create output directory if needed
     args.output_dcp.parent.mkdir(parents=True, exist_ok=True)
+
+    # Normalize run-dir to absolute so that MCP server child processes
+    # (whose cwd may be set to run_dir) can still resolve any paths we pass.
+    if args.run_dir is not None:
+        args.run_dir = args.run_dir.resolve()
     
     # Test mode - run without LLM
     if args.test:
@@ -2802,6 +3009,33 @@ Examples:
             max_nets=args.max_nets,
             run_dir=run_dir
         )
+        sys.exit(exit_code)
+
+    # Single-strategy isolation mode (no LLM): run one named strategy end-to-end
+    if args.strategy:
+        if args.run_dir is None:
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            run_dir = Path.cwd() / f"dcp_optimizer_run-{timestamp}"
+        else:
+            run_dir = args.run_dir
+
+        print(f"FPGA Design Optimization - STRATEGY MODE ({args.strategy})")
+        print(f"========================================================")
+        print(f"Input:       {args.input_dcp.resolve()}")
+        print(f"Output:      {args.output_dcp.resolve()}")
+        print(f"Run dir:     {run_dir}")
+        print()
+
+        if args.strategy == "replace":
+            exit_code = await run_replace_mode(
+                args.input_dcp,
+                args.output_dcp,
+                debug=args.debug,
+                run_dir=run_dir,
+            )
+        else:
+            print(f"Error: unknown strategy '{args.strategy}'", file=sys.stderr)
+            exit_code = 2
         sys.exit(exit_code)
 
     # Normal mode - requires API key and LLM
