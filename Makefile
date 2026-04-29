@@ -58,7 +58,7 @@ COLOR_RED := \033[0;31m
 COLOR_BLUE := \033[0;34m
 COLOR_RESET := \033[0m
 
-.PHONY: setup build-rapidwright run_optimizer run_test validate validate_demo run-submission clean veryclean help
+.PHONY: setup build-rapidwright run_optimizer run_test run_baseline validate validate_demo run-submission clean veryclean help
 
 # Default target
 help:
@@ -69,6 +69,7 @@ help:
 	@echo "  build-rapidwright  - Build RapidWright from source (git submodule)"
 	@echo "  run_optimizer      - Run optimizer on a DCP file (LLM-guided, requires API key)"
 	@echo "  run_test           - Run optimizer in test mode (no LLM, hardcoded optimization)"
+	@echo "  run_baseline       - Run deterministic fallback baseline on a DCP file (no LLM)"
 	@echo "  validate           - Validate functional equivalence between two DCPs"
 	@echo "  validate_demo      - Run validation demo (self-check)"
 	@echo "  clean              - Remove generated files (run directories, logs, Vivado outputs)"
@@ -80,6 +81,7 @@ help:
 	@echo "  make run_optimizer DCP=fpl26_contest_benchmarks/logicnets_jscl_2025.1.dcp"
 	@echo "  make run_test DCP=fpl26_contest_benchmarks/logicnets_jscl_2025.1.dcp"
 	@echo "  make run_test DCP=fpl26_contest_benchmarks/vexriscv_re-place_2025.1.dcp"
+	@echo "  make run_baseline DCP=fpl26_contest_benchmarks/logicnets_jscl_2025.1.dcp"
 	@echo "  make validate GOLDEN=design.dcp REVISED=design_optimized.dcp"
 	@echo "  make validate GOLDEN=design.dcp REVISED=design_optimized.dcp VECTORS=50000"
 	@echo "  make validate_demo"
@@ -88,10 +90,10 @@ help:
 	@echo "Environment variables:"
 	@echo "  VIVADO_EXEC     - Path to Vivado executable (default: vivado)"
 	@echo "  JAVA_HOME       - Java installation directory (auto-detected from PATH if not set)"
-	@echo "  DCP             - Input DCP file for run_optimizer / run_test targets"
+	@echo "  DCP             - Input DCP file for run_optimizer / run_test / run_baseline targets"
 	@echo "  OUTPUT          - Optional output DCP path"
 	@echo "  RUN_DIR         - Optional run directory for logs and intermediate files"
-	@echo "  MAX_NETS        - Max high fanout nets to optimize in test mode (default: 5)"
+	@echo "  MAX_NETS        - Max high fanout nets to optimize in non-LLM modes (default: 5)"
 	@echo "  GOLDEN          - Golden (reference) DCP for validation"
 	@echo "  REVISED         - Revised (optimized) DCP for validation"
 	@echo "  VECTORS         - Number of test vectors for validation (default: 10000)"
@@ -278,6 +280,37 @@ run_test:
 	fi; \
 	echo ""; \
 	$(PYTHON) dcp_optimizer.py "$(DCP)" $(if $(OUTPUT),--output "$(OUTPUT)") $(if $(RUN_DIR),--run-dir "$(RUN_DIR)") --test $(if $(MAX_NETS),--max-nets $(MAX_NETS))
+
+# Run deterministic baseline mode: benchmark-agnostic non-LLM fallback
+run_baseline:
+	@if [ -z "$(DCP)" ]; then \
+		printf "$(COLOR_RED)Error: DCP variable not set$(COLOR_RESET)\n"; \
+		echo "Usage: make run_baseline DCP=input.dcp"; \
+		exit 1; \
+	fi
+	@if [ ! -f "$(DCP)" ]; then \
+		printf "$(COLOR_RED)Error: DCP file not found: $(DCP)$(COLOR_RESET)\n"; \
+		exit 1; \
+	fi
+	@printf "$(COLOR_GREEN)Running deterministic baseline on $(DCP)...$(COLOR_RESET)\n"
+	@# Set up Java from Vivado if Java is not available
+	@if ! command -v java >/dev/null 2>&1; then \
+		printf "$(COLOR_YELLOW)Java not found on PATH, attempting to use Java from Vivado...$(COLOR_RESET)\n"; \
+		VIVADO_PATH=$$(command -v $(VIVADO_EXEC) 2>/dev/null); \
+		if [ -n "$$VIVADO_PATH" ]; then \
+			VIVADO_BIN_DIR=$$(dirname $$VIVADO_PATH); \
+			VIVADO_ROOT=$$(dirname $$VIVADO_BIN_DIR); \
+			VIVADO_JAVA="$$VIVADO_ROOT/tps/lnx64/jre11*/bin/java"; \
+			if ls $$VIVADO_JAVA >/dev/null 2>&1; then \
+				JAVA_FOUND=$$(ls $$VIVADO_JAVA | head -n 1); \
+				export JAVA_HOME=$$(dirname $$(dirname $$JAVA_FOUND)); \
+				export PATH="$$JAVA_HOME/bin:$$PATH"; \
+				printf "$(COLOR_GREEN)Using Java from Vivado: %s$(COLOR_RESET)\n" "$$JAVA_HOME"; \
+			fi; \
+		fi; \
+	fi; \
+	echo ""; \
+	$(PYTHON) dcp_optimizer.py "$(DCP)" $(if $(OUTPUT),--output "$(OUTPUT)") $(if $(RUN_DIR),--run-dir "$(RUN_DIR)") --baseline $(if $(MAX_NETS),--max-nets $(MAX_NETS))
 
 # Validation target: Validate functional equivalence between two DCPs
 validate:

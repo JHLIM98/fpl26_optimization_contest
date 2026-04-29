@@ -1498,7 +1498,343 @@ class FPGAOptimizerTest(DCPOptimizerBase):
         else:
             print("[TEST] WARNING: Could not parse clock period from Vivado")
         return period
-    
+
+    def _parse_json_text(self, text: str) -> dict:
+        """Best-effort JSON parsing for MCP tool outputs."""
+        try:
+            return json.loads(text)
+        except (TypeError, json.JSONDecodeError):
+            return {}
+
+    def _select_general_fanout_candidates(
+        self,
+        nets_report: str,
+        max_nets: int,
+        min_fanout: int = 150
+    ) -> list[tuple[str, int, int]]:
+        """
+        Pick a small number of high-value fanout candidates for the general baseline.
+
+        Stage 1 keeps this conservative: we only touch the worst 1-2 nets that
+        appear on multiple critical paths and already have high fanout.
+        """
+        nets = self.parse_high_fanout_nets(nets_report)
+        filtered = [
+            (net_name, fanout, path_count)
+            for net_name, fanout, path_count in nets
+            if fanout >= min_fanout and path_count >= 2
+        ]
+        filtered.sort(key=lambda item: (-item[2], -item[1], item[0]))
+        return filtered[:max(0, min(max_nets, 2))]
+
+    async def _measure_timing(
+        self,
+        label: str,
+        timeout: float = 300.0,
+        preview_chars: int = 2000
+    ) -> tuple[str, Optional[float]]:
+        """Report timing and return the WNS for the target clock if available."""
+        result = await self.call_vivado_tool("report_timing_summary", {}, timeout=timeout)
+        print(f"{label} timing summary (first {preview_chars} chars):\n{result[:preview_chars]}...")
+        logger.info(f"{label} timing summary: {result}")
+
+        target_wns = await self.get_wns_for_target_clock(self._call_vivado_for_clock)
+        if target_wns is not None:
+            return result, target_wns
+        return result, self.parse_wns_from_timing_report(result)
+
+    async def _route_and_report_status(
+        self,
+        directive: str = "Default",
+        timeout: float = 3600.0
+    ) -> str:
+        """Route the current design and print a short route-status preview."""
+        route_result = await self.call_vivado_tool("route_design", {
+            "directive": directive
+        }, timeout=timeout)
+        print(f"Route design result:\n{route_result}")
+        logger.info(f"Route design: {route_result}")
+
+        status = await self.call_vivado_tool("report_route_status", {
+            "show_unrouted": True,
+            "show_errors": True,
+            "max_nets": 20
+        }, timeout=300.0)
+        print(f"Route status after routing:\n{status[:1500]}...")
+        logger.info(f"Route status after routing: {status}")
+        return status
+
+    async def run_deterministic_baseline(
+        self,
+        input_dcp: Path,
+        output_dcp: Path,
+        max_nets_to_optimize: int = 2
+    ) -> bool:
+        """
+        Run a benchmark-agnostic deterministic fallback flow without any LLM.
+
+        Strategy order is intentionally conservative for alpha submission:
+        1. Try limited high-fanout optimization first because it is localized and easy to skip.
+        2. Fall back to a safe Vivado phys_opt directive for general routed designs.
+        3. Always write a final DCP, even if no improvement is found.
+        """
+        print("\n" + "="*70)
+        print("FPGA OPTIMIZER DETERMINISTIC BASELINE MODE")
+        print("="*70)
+        print(f"Input DCP:  {input_dcp}")
+        print(f"Output DCP: {output_dcp}")
+        print(f"Temp dir:   {self.temp_dir}")
+        print(f"Fanout candidate limit: {max(0, min(max_nets_to_optimize, 2))}")
+        print("="*70 + "\n")
+
+        overall_start = time.time()
+        best_checkpoint = Path(self.temp_dir) / "baseline_best.dcp"
+        fanout_checkpoint = Path(self.temp_dir) / "baseline_fanout_candidate.dcp"
+        best_source_dcp = input_dcp.resolve()
+        best_strategy = "no-op"
+        strategy_notes: list[str] = []
+
+        try:
+            # RapidWright is optional for the Stage 1 baseline. If initialization
+            # fails, we still continue with the Vivado-only phys_opt fallback.
+            rapidwright_available = False
+            print("\n" + "-"*60)
+            print("STEP 0: Initialize RapidWright (optional)")
+            print("-"*60)
+            try:
+                rw_init = await self.call_rapidwright_tool("initialize_rapidwright", {
+                    "jvm_max_memory": "8G"
+                }, timeout=120.0)
+                rw_init_json = self._parse_json_text(rw_init)
+                rapidwright_available = rw_init_json.get("status") in {"success", "already_initialized"}
+                if rapidwright_available:
+                    print("RapidWright initialized successfully for fanout optimization.")
+                else:
+                    print("RapidWright unavailable; baseline will skip fanout optimization.")
+                    strategy_notes.append("RapidWright initialization failed, skipping fanout optimization")
+            except Exception as e:
+                print(f"RapidWright initialization failed: {e}")
+                logger.warning(f"Baseline continuing without RapidWright: {e}")
+                strategy_notes.append("RapidWright initialization failed, skipping fanout optimization")
+
+            print("\n" + "-"*60)
+            print("STEP 1: Open input DCP in Vivado")
+            print("-"*60)
+            result = await self.call_vivado_tool("open_checkpoint", {
+                "dcp_path": str(input_dcp.resolve())
+            }, timeout=600.0)
+            print(f"Open checkpoint result:\n{result}")
+            logger.info(f"Open checkpoint result: {result}")
+
+            print("\n" + "-"*60)
+            print("STEP 2: Measure baseline timing")
+            print("-"*60)
+            baseline_report, baseline_wns = await self._measure_timing("Baseline")
+            self.clock_period = await self.fetch_clock_period()
+            self.initial_wns = baseline_wns
+            self.final_wns = baseline_wns
+            self.print_fmax_status("Initial", self.initial_wns)
+            logger.info(f"Baseline initial WNS: {self.initial_wns} ns")
+
+            if self.initial_wns is not None and self.initial_wns >= 0:
+                print("\nTiming already met; writing checkpoint without additional optimization.")
+                strategy_notes.append("Timing already met; emitted original routed checkpoint")
+                result = await self.call_vivado_tool("write_checkpoint", {
+                    "dcp_path": str(output_dcp.resolve()),
+                    "force": True
+                }, timeout=600.0)
+                print(f"Write final DCP result:\n{result}")
+                elapsed = time.time() - overall_start
+                self.print_test_summary(
+                    title="TEST SUMMARY - DETERMINISTIC BASELINE",
+                    elapsed_seconds=elapsed,
+                    initial_wns=self.initial_wns,
+                    final_wns=self.final_wns,
+                    clock_period=self.clock_period,
+                    extra_info="Strategy: no-op (timing already met)"
+                )
+                return True
+
+            print("\n" + "-"*60)
+            print("STEP 3: Select deterministic strategy")
+            print("-"*60)
+            nets_report = await self.call_vivado_tool("get_critical_high_fanout_nets", {
+                "num_paths": 30,
+                "min_fanout": 120,
+                "exclude_clocks": True
+            }, timeout=600.0)
+            logger.info(f"High fanout nets report: {nets_report}")
+            fanout_candidates = self._select_general_fanout_candidates(
+                nets_report,
+                max_nets=max_nets_to_optimize,
+                min_fanout=150
+            )
+
+            if fanout_candidates:
+                print("Selected limited fanout optimization because strong shared high-fanout nets were found:")
+                for net_name, fanout, path_count in fanout_candidates:
+                    print(f"  - {net_name} (fanout={fanout}, critical_paths={path_count})")
+                strategy_notes.append(
+                    f"Selected fanout-first path due to {len(fanout_candidates)} strong high-fanout candidates"
+                )
+            else:
+                print("No strong shared high-fanout candidates found; using phys_opt as the primary baseline strategy.")
+                strategy_notes.append("No strong high-fanout candidates found; using phys_opt fallback")
+
+            current_best_wns = self.initial_wns
+
+            # Fanout comes first because it is localized, deterministic, and easy
+            # to abandon if the design does not respond well.
+            if rapidwright_available and fanout_candidates:
+                print("\n" + "-"*60)
+                print("STEP 4: Try limited fanout optimization")
+                print("-"*60)
+                try:
+                    rw_read = await self.call_rapidwright_tool("read_checkpoint", {
+                        "dcp_path": str(input_dcp.resolve())
+                    }, timeout=600.0)
+                    rw_read_json = self._parse_json_text(rw_read)
+                    if rw_read_json.get("status") != "success":
+                        raise RuntimeError(rw_read)
+
+                    successful_optimizations = 0
+                    for i, (net_name, fanout, path_count) in enumerate(fanout_candidates, start=1):
+                        split_factor = max(3, min(4, fanout // 100))
+                        print(f"[{i}/{len(fanout_candidates)}] Fanout optimization: {net_name}")
+                        print(f"    Fanout: {fanout}, Critical paths: {path_count}, Split factor: {split_factor}")
+                        opt_result = await self.call_rapidwright_tool("optimize_fanout", {
+                            "net_name": net_name,
+                            "split_factor": split_factor
+                        }, timeout=300.0)
+                        opt_result_json = self._parse_json_text(opt_result)
+                        if opt_result_json.get("status") == "success":
+                            successful_optimizations += 1
+                            print(f"    Success: {opt_result_json.get('message', 'fanout split complete')}")
+                        else:
+                            print(f"    Skipped: {opt_result_json.get('error', opt_result)}")
+
+                    if successful_optimizations > 0:
+                        result = await self.call_rapidwright_tool("write_checkpoint", {
+                            "dcp_path": str(fanout_checkpoint.resolve()),
+                            "overwrite": True
+                        }, timeout=600.0)
+                        print(f"RapidWright write checkpoint result:\n{result}")
+
+                        await self.call_vivado_tool("open_checkpoint", {
+                            "dcp_path": str(fanout_checkpoint.resolve())
+                        }, timeout=600.0)
+                        await self._route_and_report_status()
+                        _, fanout_wns = await self._measure_timing("Post-fanout")
+
+                        if fanout_wns is not None and (current_best_wns is None or fanout_wns > current_best_wns):
+                            current_best_wns = fanout_wns
+                            best_strategy = "fanout"
+                            print("Fanout optimization improved timing; capturing best checkpoint.")
+                            strategy_notes.append(
+                                f"Fanout optimization improved WNS to {fanout_wns:.3f} ns"
+                            )
+                            await self.call_vivado_tool("write_checkpoint", {
+                                "dcp_path": str(best_checkpoint.resolve()),
+                                "force": True
+                            }, timeout=600.0)
+                            best_source_dcp = best_checkpoint.resolve()
+                        else:
+                            print("Fanout optimization did not improve timing; reverting to original checkpoint.")
+                            strategy_notes.append("Fanout attempt completed but did not improve timing")
+                            await self.call_vivado_tool("open_checkpoint", {
+                                "dcp_path": str(best_source_dcp)
+                            }, timeout=600.0)
+                    else:
+                        print("No fanout optimizations succeeded; proceeding to phys_opt fallback.")
+                        strategy_notes.append("Fanout candidates selected, but no RapidWright fanout edits succeeded")
+                except Exception as e:
+                    print(f"Fanout optimization path failed safely: {e}")
+                    logger.warning(f"Fanout path failed; continuing with phys_opt fallback: {e}")
+                    strategy_notes.append(f"Fanout path failed safely: {e}")
+                    await self.call_vivado_tool("open_checkpoint", {
+                        "dcp_path": str(best_source_dcp)
+                    }, timeout=600.0)
+
+            print("\n" + "-"*60)
+            print("STEP 5: Run conservative phys_opt fallback")
+            print("-"*60)
+            await self.call_vivado_tool("open_checkpoint", {
+                "dcp_path": str(best_source_dcp)
+            }, timeout=600.0)
+            print("Using phys_opt_design -directive RuntimeOptimized as the general fallback.")
+            try:
+                result = await self.call_vivado_tool("phys_opt_design", {
+                    "directive": "RuntimeOptimized"
+                }, timeout=3600.0)
+                print(f"Phys opt result:\n{result}")
+                logger.info(f"Phys opt result: {result}")
+                await self._route_and_report_status()
+                _, physopt_wns = await self._measure_timing("Post-phys_opt")
+
+                if physopt_wns is not None and (current_best_wns is None or physopt_wns > current_best_wns):
+                    current_best_wns = physopt_wns
+                    best_strategy = "phys_opt"
+                    print("Phys opt improved timing; capturing best checkpoint.")
+                    strategy_notes.append(f"phys_opt improved WNS to {physopt_wns:.3f} ns")
+                    await self.call_vivado_tool("write_checkpoint", {
+                        "dcp_path": str(best_checkpoint.resolve()),
+                        "force": True
+                    }, timeout=600.0)
+                    best_source_dcp = best_checkpoint.resolve()
+                else:
+                    print("Phys opt did not improve timing; keeping previously best checkpoint.")
+                    strategy_notes.append("phys_opt completed but did not improve timing")
+            except Exception as e:
+                print(f"phys_opt fallback failed safely: {e}")
+                logger.warning(f"phys_opt fallback failed: {e}")
+                strategy_notes.append(f"phys_opt fallback failed safely: {e}")
+
+            print("\n" + "-"*60)
+            print("STEP 6: Write final deterministic baseline DCP")
+            print("-"*60)
+            await self.call_vivado_tool("open_checkpoint", {
+                "dcp_path": str(best_source_dcp)
+            }, timeout=600.0)
+            _, self.final_wns = await self._measure_timing("Final")
+            self.print_fmax_status("Final", self.final_wns)
+            self.print_wns_change(self.initial_wns, self.final_wns, self.clock_period)
+
+            result = await self.call_vivado_tool("write_checkpoint", {
+                "dcp_path": str(output_dcp.resolve()),
+                "force": True
+            }, timeout=600.0)
+            print(f"Write final DCP result:\n{result}")
+
+            # Validation Phase 1 reopens the final DCP in RapidWright, so emit a
+            # readable EDIF alongside the Vivado checkpoint.
+            final_edif = output_dcp.with_suffix(".edf")
+            result = await self.call_vivado_tool("write_edif", {
+                "edif_path": str(final_edif.resolve()),
+                "force": True
+            }, timeout=600.0)
+            print(f"Write final EDIF result:\n{result}")
+
+            elapsed = time.time() - overall_start
+            extra_info = (
+                f"Strategy: {best_strategy}\n"
+                f"Notes: {'; '.join(strategy_notes)}"
+            )
+            self.print_test_summary(
+                title="TEST SUMMARY - DETERMINISTIC BASELINE",
+                elapsed_seconds=elapsed,
+                initial_wns=self.initial_wns,
+                final_wns=self.final_wns,
+                clock_period=self.clock_period,
+                extra_info=extra_info
+            )
+            return True
+
+        except Exception as e:
+            logger.exception(f"Deterministic baseline failed with exception: {e}")
+            print(f"\n*** DETERMINISTIC BASELINE FAILED ***")
+            print(f"Exception: {type(e).__name__}: {e}")
+            return False
+
     async def run_test(self, input_dcp: Path, output_dcp: Path, max_nets_to_optimize: int = 5) -> bool:
         """
         Run the deterministic test optimization flow.
@@ -2294,6 +2630,48 @@ async def run_test_mode(input_dcp: Path, output_dcp: Path, debug: bool = False, 
         await tester.cleanup()
 
 
+async def run_baseline_mode(
+    input_dcp: Path,
+    output_dcp: Path,
+    debug: bool = False,
+    max_nets: int = 2,
+    run_dir: Optional[Path] = None
+):
+    """Run the benchmark-agnostic deterministic fallback baseline."""
+    tester = FPGAOptimizerTest(debug=debug, run_dir=run_dir)
+
+    try:
+        await tester.start_servers()
+        success = await tester.run_deterministic_baseline(
+            input_dcp,
+            output_dcp,
+            max_nets_to_optimize=max_nets
+        )
+
+        if success:
+            print("\n[BASELINE] Deterministic baseline completed successfully")
+            print(f"\n[BASELINE] Output files:")
+            print(f"[BASELINE]   Optimized DCP: {output_dcp}")
+            print(f"[BASELINE]   Run directory: {tester.run_dir}")
+            return 0
+
+        print("\n[BASELINE] Deterministic baseline failed")
+        print(f"[BASELINE] Run directory: {tester.run_dir}")
+        return 1
+
+    except KeyboardInterrupt:
+        print("\n[BASELINE] Interrupted by user")
+        print(f"[BASELINE] Run directory: {tester.run_dir}")
+        return 130
+    except Exception as e:
+        logger.exception(f"Deterministic baseline fatal error: {e}")
+        print(f"\n[BASELINE] Fatal error: {e}")
+        print(f"[BASELINE] Run directory: {tester.run_dir}")
+        return 1
+    finally:
+        await tester.cleanup()
+
+
 async def main():
     parser = argparse.ArgumentParser(
         description="FPGA Design Optimization Agent",
@@ -2302,6 +2680,7 @@ async def main():
 Examples:
   python dcp_optimizer.py input.dcp
   python dcp_optimizer.py input.dcp --output output.dcp
+  python dcp_optimizer.py input.dcp --baseline
   python dcp_optimizer.py input.dcp --model anthropic/claude-sonnet-4
   python dcp_optimizer.py input.dcp --debug
   python dcp_optimizer.py fpl26_contest_benchmarks/logicnets_jscl_2025.1.dcp --test
@@ -2339,10 +2718,15 @@ Examples:
         help="Test mode: run without LLM. Pblock for LogicNets, cell re-placement for VexRiscv (see docs/optimization_example.md)."
     )
     parser.add_argument(
+        "--baseline",
+        action="store_true",
+        help="Deterministic fallback mode: run a benchmark-agnostic non-LLM baseline using limited fanout optimization and phys_opt."
+    )
+    parser.add_argument(
         "--max-nets",
         type=int,
         default=5,
-        help="Maximum number of high fanout nets to optimize in test mode (default: 5)"
+        help="Maximum number of high fanout nets to optimize in non-LLM modes (default: 5)"
     )
     parser.add_argument(
         "--run-dir",
@@ -2394,11 +2778,33 @@ Examples:
             run_dir=run_dir
         )
         sys.exit(exit_code)
-    
+
+    # Deterministic baseline mode - benchmark agnostic, no LLM required
+    if args.baseline:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        run_dir = Path.cwd() / f"dcp_optimizer_run-{timestamp}"
+
+        print(f"FPGA Design Optimization - DETERMINISTIC BASELINE MODE")
+        print(f"========================================================")
+        print(f"Input:       {args.input_dcp.resolve()}")
+        print(f"Output:      {args.output_dcp.resolve()}")
+        print(f"Run dir:     {run_dir}")
+        print(f"Max nets to optimize: {max(0, min(args.max_nets, 2))}")
+        print()
+
+        exit_code = await run_baseline_mode(
+            args.input_dcp,
+            args.output_dcp,
+            debug=args.debug,
+            max_nets=args.max_nets,
+            run_dir=run_dir
+        )
+        sys.exit(exit_code)
+
     # Normal mode - requires API key and LLM
     if not args.api_key:
         print("Error: OpenRouter API key required. Set OPENROUTER_API_KEY or use --api-key", file=sys.stderr)
-        print("       Use --test flag to run in test mode without LLM", file=sys.stderr)
+        print("       Use --test or --baseline to run without LLM", file=sys.stderr)
         sys.exit(1)
     
     if OpenAI is None:

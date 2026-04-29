@@ -6,4 +6,5 @@ __pycache__
 *.tar.gz
 MD5SUM
 outputs/
+fpl26_contest_benchmarks/
 
