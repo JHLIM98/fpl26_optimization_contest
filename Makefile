@@ -313,7 +313,7 @@ run_baseline:
 		fi; \
 	fi; \
 	echo ""; \
-	$(PYTHON) dcp_optimizer.py "$(DCP)" $(if $(OUTPUT),--output "$(OUTPUT)") $(if $(RUN_DIR),--run-dir "$(RUN_DIR)") --baseline $(if $(MAX_NETS),--max-nets $(MAX_NETS))
+	$(PYTHON) dcp_optimizer.py "$(DCP)" $(if $(OUTPUT),--output "$(OUTPUT)") $(if $(RUN_DIR),--run-dir "$(RUN_DIR)") --baseline $(if $(MAX_NETS),--max-nets $(MAX_NETS)) $(if $(PHYS_OPT_DIRECTIVE),--phys-opt-directive $(PHYS_OPT_DIRECTIVE))
 
 # Run a single named optimization strategy in isolation (no LLM).
 # Currently supported: STRATEGY=replace (RapidWright cell re-placement).

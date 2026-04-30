@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+#
+# Run a strategy x benchmark matrix and write a summary TSV.
+#
+# Strategies (currently supported):
+#   baseline_runtime   - run_baseline with phys_opt directive RuntimeOptimized (default)
+#   baseline_default   - run_baseline with phys_opt directive Default
+#   baseline_explore   - run_baseline with phys_opt directive Explore
+#   baseline_aggr_explore  - run_baseline with phys_opt directive AggressiveExplore
+#   baseline_aggr_fanout   - run_baseline with phys_opt directive AggressiveFanoutOpt
+#   replace            - --strategy replace (RapidWright cell re-placement)
+#
+# Output layout (under outputs/):
+#   matrix/<dcp_stem>-<strategy>-<ts>.log         per-experiment optimizer stdout
+#   matrix/<dcp_stem>-<strategy>-<ts>/            per-experiment run dir
+#   result/<dcp_stem>_<strategy>-<ts>.dcp         optimized DCP
+#   strategy_matrix_summary.tsv                   summary table
+#   strategy_matrix.log                           sweep progress log
+#
+# Coverage policy (chosen for time budget):
+#   - Small DCPs (<=18M): every strategy in SMALL_STRATEGIES
+#   - Large DCPs (>=26M): every strategy in LARGE_STRATEGIES (subset for time)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+BENCH_DIR_REL="fpl26_contest_benchmarks"
+OUTPUTS_DIR="${PROJECT_ROOT}/outputs"
+MATRIX_DIR="${OUTPUTS_DIR}/matrix"
+RESULT_DIR="${OUTPUTS_DIR}/result"
+SUMMARY="${OUTPUTS_DIR}/strategy_matrix_summary.tsv"
+SWEEP_LOG="${OUTPUTS_DIR}/strategy_matrix.log"
+
+mkdir -p "${MATRIX_DIR}" "${RESULT_DIR}"
+cd "${PROJECT_ROOT}"
+
+# Strategy lists (override via env vars)
+SMALL_STRATEGIES="${SMALL_STRATEGIES:-baseline_runtime replace baseline_explore baseline_aggr_fanout}"
+LARGE_STRATEGIES="${LARGE_STRATEGIES:-baseline_runtime replace}"
+SIZE_THRESHOLD_MB="${SIZE_THRESHOLD_MB:-20}"   # >= this MB counts as "large"
+
+# DCP list discovery (skip already-optimized files)
+mapfile -t ALL_DCPS < <(
+    find "${BENCH_DIR_REL}" -maxdepth 1 -type f -name "*.dcp" ! -name "*_optimized*" ! -name "*_replace-*" \
+         -printf "%s\t%P\n" | sort -n | awk -F'\t' '{print $2}'
+)
+
+# Map strategy name -> python invocation arg suffix
+strategy_args() {
+    case "$1" in
+        baseline_runtime)      echo "--baseline --phys-opt-directive RuntimeOptimized" ;;
+        baseline_default)      echo "--baseline --phys-opt-directive Default" ;;
+        baseline_explore)      echo "--baseline --phys-opt-directive Explore" ;;
+        baseline_aggr_explore) echo "--baseline --phys-opt-directive AggressiveExplore" ;;
+        baseline_aggr_fanout)  echo "--baseline --phys-opt-directive AggressiveFanoutOpt" ;;
+        replace)               echo "--strategy replace" ;;
+        *) echo ""; return 1 ;;
+    esac
+}
+
+# Decide which strategies a given DCP file gets, based on size
+strategies_for_dcp() {
+    local dcp_path="$1"
+    local size_bytes; size_bytes=$(stat -c%s "${dcp_path}")
+    local size_mb=$((size_bytes / 1024 / 1024))
+    if [ "${size_mb}" -ge "${SIZE_THRESHOLD_MB}" ]; then
+        echo "${LARGE_STRATEGIES}"
+    else
+        echo "${SMALL_STRATEGIES}"
+    fi
+}
+
+# Initialise summary + log
+printf "DCP\tSTRATEGY\tSTATUS\tINITIAL_FMAX\tFINAL_FMAX\tDELTA_MHZ\tROUTING_ERRORS\tRUNTIME_S\n" > "${SUMMARY}"
+: > "${SWEEP_LOG}"
+
+{
+    echo "===== Strategy Matrix Sweep ====="
+    echo "Started:           $(date '+%F %T')"
+    echo "DCPs found:        ${#ALL_DCPS[@]}"
+    echo "Size threshold:    ${SIZE_THRESHOLD_MB} MB"
+    echo "Small strategies:  ${SMALL_STRATEGIES}"
+    echo "Large strategies:  ${LARGE_STRATEGIES}"
+    echo "Summary:           ${SUMMARY}"
+    echo "================================="
+    echo ""
+} | tee -a "${SWEEP_LOG}"
+
+# Pre-print plan
+plan_count=0
+for dcp_name in "${ALL_DCPS[@]}"; do
+    list=$(strategies_for_dcp "${BENCH_DIR_REL}/${dcp_name}")
+    for s in ${list}; do
+        plan_count=$((plan_count + 1))
+    done
+done
+echo "Total experiments planned: ${plan_count}" | tee -a "${SWEEP_LOG}"
+echo "" | tee -a "${SWEEP_LOG}"
+
+idx=0
+for dcp_name in "${ALL_DCPS[@]}"; do
+    dcp_path="${BENCH_DIR_REL}/${dcp_name}"
+    stem="${dcp_name%.dcp}"
+    strategies=$(strategies_for_dcp "${dcp_path}")
+
+    for strategy in ${strategies}; do
+        idx=$((idx + 1))
+        timestamp="$(date +%Y%m%d_%H%M%S)"
+        output_dcp="${RESULT_DIR}/${stem}_${strategy}-${timestamp}.dcp"
+        run_dir="${MATRIX_DIR}/${stem}-${strategy}-${timestamp}"
+        log_file="${MATRIX_DIR}/${stem}-${strategy}-${timestamp}.log"
+        # Use absolute paths (so MCP child cwd doesn't break things)
+        abs_output_dcp="${PROJECT_ROOT}/${output_dcp#${PROJECT_ROOT}/}"
+        abs_run_dir="${PROJECT_ROOT}/${run_dir#${PROJECT_ROOT}/}"
+
+        suffix=$(strategy_args "${strategy}") || {
+            echo "[${idx}/${plan_count}] SKIP unknown strategy: ${strategy}" | tee -a "${SWEEP_LOG}"
+            continue
+        }
+
+        {
+            echo "----------------------------------------"
+            echo "[${idx}/${plan_count}] [$(date '+%F %T')] ${dcp_name}  ::  ${strategy}"
+            echo "  Output:  ${output_dcp}"
+            echo "  Run dir: ${run_dir}"
+            echo "  Log:     ${log_file}"
+        } | tee -a "${SWEEP_LOG}"
+
+        start_ts=$(date +%s)
+        if python3 dcp_optimizer.py "${dcp_path}" --output "${abs_output_dcp}" --run-dir "${abs_run_dir}" ${suffix} \
+                > "${log_file}" 2>&1; then
+            status="OK"
+        else
+            status="FAIL"
+        fi
+        end_ts=$(date +%s)
+        runtime=$((end_ts - start_ts))
+
+        # Parse metrics from per-experiment log (works for both baseline and replace)
+        if [ "${strategy}" = "replace" ]; then
+            initial_wns=$(grep -oP 'Initial WNS:\s+\K-?[\d.]+' "${log_file}" | head -1 || true)
+            final_wns=$(grep -oP 'Final WNS:\s+\K-?[\d.]+'   "${log_file}" | head -1 || true)
+            clock_period=$(grep -oP 'Clock period:\s+\K[\d.]+' "${log_file}" | head -1 || true)
+            routing_errors=$(grep -oP 'Routing errors:\s+\K-?\d+' "${log_file}" | head -1 || true)
+            # Compute Fmax from WNS + clock period
+            if [ -n "${initial_wns:-}" ] && [ -n "${clock_period:-}" ]; then
+                initial_fmax=$(awk -v p="${clock_period}" -v w="${initial_wns}" 'BEGIN{ if (p-w==0){print "N/A"} else {printf "%.2f", 1000.0/(p-w)} }')
+            else
+                initial_fmax="N/A"
+            fi
+            if [ -n "${final_wns:-}" ] && [ -n "${clock_period:-}" ]; then
+                final_fmax=$(awk -v p="${clock_period}" -v w="${final_wns}" 'BEGIN{ if (p-w==0){print "N/A"} else {printf "%.2f", 1000.0/(p-w)} }')
+            else
+                final_fmax="N/A"
+            fi
+            if [ "${initial_fmax}" != "N/A" ] && [ "${final_fmax}" != "N/A" ]; then
+                delta=$(awk -v a="${initial_fmax}" -v b="${final_fmax}" 'BEGIN{printf "%.2f", b-a}')
+            else
+                delta="N/A"
+            fi
+        else
+            initial_fmax=$(grep -oP 'Initial Fmax:\s+\K[\d.]+' "${log_file}" | head -1 || true)
+            final_fmax=$(grep -oP 'Final Fmax:\s+\K[\d.]+'   "${log_file}" | head -1 || true)
+            delta=$(grep -oP 'Fmax Improvement:\s+\+?\K-?[\d.]+' "${log_file}" | head -1 || true)
+            initial_fmax="${initial_fmax:-N/A}"
+            final_fmax="${final_fmax:-N/A}"
+            delta="${delta:-N/A}"
+            routing_errors=""
+        fi
+        routing_errors="${routing_errors:-N/A}"
+
+        line="$(printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d" "${dcp_name}" "${strategy}" "${status}" "${initial_fmax}" "${final_fmax}" "${delta}" "${routing_errors}" "${runtime}")"
+        echo "${line}" >> "${SUMMARY}"
+        echo "  -> ${status}  initial=${initial_fmax}  final=${final_fmax}  delta=${delta}  rerr=${routing_errors}  runtime=${runtime}s" | tee -a "${SWEEP_LOG}"
+        echo "" | tee -a "${SWEEP_LOG}"
+    done
+done
+
+{
+    echo "===== Strategy Matrix Sweep COMPLETE ====="
+    echo "Finished: $(date '+%F %T')"
+    echo ""
+    if command -v column >/dev/null 2>&1; then
+        column -t -s $'\t' "${SUMMARY}"
+    else
+        cat "${SUMMARY}"
+    fi
+} | tee -a "${SWEEP_LOG}"

@@ -1568,7 +1568,8 @@ class FPGAOptimizerTest(DCPOptimizerBase):
         self,
         input_dcp: Path,
         output_dcp: Path,
-        max_nets_to_optimize: int = 2
+        max_nets_to_optimize: int = 2,
+        phys_opt_directive: str = "RuntimeOptimized",
     ) -> bool:
         """
         Run a benchmark-agnostic deterministic fallback flow without any LLM.
@@ -1761,10 +1762,10 @@ class FPGAOptimizerTest(DCPOptimizerBase):
             await self.call_vivado_tool("open_checkpoint", {
                 "dcp_path": str(best_source_dcp)
             }, timeout=600.0)
-            print("Using phys_opt_design -directive RuntimeOptimized as the general fallback.")
+            print(f"Using phys_opt_design -directive {phys_opt_directive} as the general fallback.")
             try:
                 result = await self.call_vivado_tool("phys_opt_design", {
-                    "directive": "RuntimeOptimized"
+                    "directive": phys_opt_directive
                 }, timeout=3600.0)
                 print(f"Phys opt result:\n{result}")
                 logger.info(f"Phys opt result: {result}")
@@ -2782,7 +2783,8 @@ async def run_baseline_mode(
     output_dcp: Path,
     debug: bool = False,
     max_nets: int = 2,
-    run_dir: Optional[Path] = None
+    run_dir: Optional[Path] = None,
+    phys_opt_directive: str = "RuntimeOptimized",
 ):
     """Run the benchmark-agnostic deterministic fallback baseline."""
     tester = FPGAOptimizerTest(debug=debug, run_dir=run_dir)
@@ -2792,7 +2794,8 @@ async def run_baseline_mode(
         success = await tester.run_deterministic_baseline(
             input_dcp,
             output_dcp,
-            max_nets_to_optimize=max_nets
+            max_nets_to_optimize=max_nets,
+            phys_opt_directive=phys_opt_directive,
         )
 
         if success:
@@ -2925,6 +2928,13 @@ Examples:
              "More strategies (pblock, fanout, phys_opt) will be added."
     )
     parser.add_argument(
+        "--phys-opt-directive",
+        default="RuntimeOptimized",
+        help="phys_opt_design -directive used by the baseline mode's STEP 5 fallback "
+             "(e.g. RuntimeOptimized, Default, Explore, AggressiveExplore, AggressiveFanoutOpt). "
+             "Default: RuntimeOptimized."
+    )
+    parser.add_argument(
         "--max-nets",
         type=int,
         default=5,
@@ -3007,7 +3017,8 @@ Examples:
             args.output_dcp,
             debug=args.debug,
             max_nets=args.max_nets,
-            run_dir=run_dir
+            run_dir=run_dir,
+            phys_opt_directive=args.phys_opt_directive,
         )
         sys.exit(exit_code)
 
