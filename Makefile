@@ -389,7 +389,7 @@ validate:
 	@printf "$(COLOR_GREEN)Revised DCP:$(COLOR_RESET) $(REVISED)\n"
 	@printf "$(COLOR_GREEN)Test Vectors:$(COLOR_RESET) $(or $(VECTORS),10000)\n"
 	@echo ""
-	$(PYTHON) validate_dcps.py "$(GOLDEN)" "$(REVISED)" $(if $(VECTORS),--vectors $(VECTORS)) $(if $(WORK_DIR),--work-dir "$(WORK_DIR)")
+	$(PYTHON) validate_dcps.py "$(GOLDEN)" "$(REVISED)" $(if $(VECTORS),--vectors $(VECTORS)) $(if $(WORK_DIR),--work-dir "$(WORK_DIR)") $(if $(SKIP_PHASE1),--skip-phase1) $(if $(FORCE_PHASE2),--force-phase2)
 
 # Quick validation example using demo DCPs
 validate_demo:

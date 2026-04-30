@@ -42,11 +42,13 @@ logger = logging.getLogger(__name__)
 class DCPValidator:
     """Validates functional equivalence between two DCPs."""
     
-    def __init__(self, golden_dcp: Path, revised_dcp: Path, num_vectors: int = 10000, debug: bool = False, work_dir: Optional[Path] = None):
+    def __init__(self, golden_dcp: Path, revised_dcp: Path, num_vectors: int = 10000, debug: bool = False, work_dir: Optional[Path] = None, skip_phase1: bool = False, force_phase2: bool = False):
         self.golden_dcp = golden_dcp
         self.revised_dcp = revised_dcp
         self.num_vectors = num_vectors
         self.debug = debug
+        self.skip_phase1 = skip_phase1
+        self.force_phase2 = force_phase2
 
         self.exit_stack = AsyncExitStack()
         self.rapidwright_session: Optional[ClientSession] = None
@@ -862,13 +864,18 @@ endmodule
         print("="*70)
         
         # Phase 1: Structural checks
-        phase1_passed = await self.phase1_structural_checks()
-        
-        if not phase1_passed:
-            print("\n⚠ Skipping Phase 2 due to Phase 1 failures")
-            elapsed = time.time() - start_time
-            self.print_final_report(elapsed)
-            return False
+        if self.skip_phase1:
+            print("\n⚠ Skipping Phase 1 (structural checks) per --skip-phase1")
+            phase1_passed = True
+            self.phase1_passed = True
+        else:
+            phase1_passed = await self.phase1_structural_checks()
+
+            if not phase1_passed and not self.force_phase2:
+                print("\n⚠ Skipping Phase 2 due to Phase 1 failures (use --force-phase2 to override)")
+                elapsed = time.time() - start_time
+                self.print_final_report(elapsed)
+                return False
         
         # Phase 2: Functional simulation
         phase2_result = await self.phase2_functional_simulation()
@@ -980,6 +987,17 @@ Examples:
         help="Parent directory for the dcp_validation_<random>/ workspace. "
              "Default: outputs/validation/ in the repo."
     )
+    parser.add_argument(
+        "--skip-phase1",
+        action="store_true",
+        help="Skip Phase 1 (structural sanity) entirely; go straight to simulation. "
+             "Useful when Phase 1 reports false positives."
+    )
+    parser.add_argument(
+        "--force-phase2",
+        action="store_true",
+        help="Run Phase 2 (simulation) even if Phase 1 fails."
+    )
 
     args = parser.parse_args()
     
@@ -1002,6 +1020,8 @@ Examples:
         num_vectors=args.vectors,
         debug=args.debug,
         work_dir=args.work_dir,
+        skip_phase1=args.skip_phase1,
+        force_phase2=args.force_phase2,
     )
     
     try:
