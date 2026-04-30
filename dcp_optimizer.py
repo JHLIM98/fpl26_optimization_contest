@@ -1990,6 +1990,7 @@ class FPGAOptimizerTest(DCPOptimizerBase):
         pblock_ranges: Optional[str] = None,
         place_directive: str = "Default",
         route_directive: str = "Default",
+        util_factor: float = 1.5,
     ) -> dict:
         """Benchmark-agnostic pblock area-constraint flow.
 
@@ -2073,12 +2074,12 @@ class FPGAOptimizerTest(DCPOptimizerBase):
                         f"snippet={util_raw[:300]!r}"
                     )
                     return stats
-                target_lut  = int(used_lut  * 1.5)
-                target_ff   = int(used_ff   * 1.5)
-                target_dsp  = int(used_dsp  * 1.5)
-                target_bram = int(used_bram * 1.5)
+                target_lut  = int(used_lut  * util_factor)
+                target_ff   = int(used_ff   * util_factor)
+                target_dsp  = int(used_dsp  * util_factor)
+                target_bram = int(used_bram * util_factor)
                 notes.append(f"Used: LUT={used_lut} FF={used_ff} DSP={used_dsp} BRAM={used_bram}")
-                notes.append(f"Targets (1.5x): LUT={target_lut} FF={target_ff} DSP={target_dsp} BRAM={target_bram}")
+                notes.append(f"Targets ({util_factor}x): LUT={target_lut} FF={target_ff} DSP={target_dsp} BRAM={target_bram}")
 
                 # (3) RapidWright init + read
                 await self.call_rapidwright_tool("initialize_rapidwright", {
@@ -3025,13 +3026,14 @@ async def run_pblock_mode(
     debug: bool = False,
     run_dir: Optional[Path] = None,
     pblock_ranges: Optional[str] = None,
+    util_factor: float = 1.5,
 ):
     """Run the pblock-based area-constraint strategy in isolation."""
     tester = FPGAOptimizerTest(debug=debug, run_dir=run_dir)
 
     try:
         await tester.start_servers()
-        stats = await tester.try_pblock(input_dcp, output_dcp, pblock_ranges=pblock_ranges)
+        stats = await tester.try_pblock(input_dcp, output_dcp, pblock_ranges=pblock_ranges, util_factor=util_factor)
 
         for note in stats["notes"]:
             print(f"[PBLOCK] {note}")
@@ -3176,6 +3178,14 @@ Examples:
              "If omitted, ranges are auto-derived from utilization + RW fabric analysis."
     )
     parser.add_argument(
+        "--pblock-util-factor",
+        type=float,
+        default=1.5,
+        help="Multiplier applied to current utilization to size the pblock (default: 1.5). "
+             "Larger values give the placer more room (often helps LUT-dominant designs); "
+             "ignored when --pblock-ranges is supplied."
+    )
+    parser.add_argument(
         "--phys-opt-directive",
         default="RuntimeOptimized",
         help="phys_opt_design -directive used by the baseline mode's STEP 5 fallback "
@@ -3299,6 +3309,7 @@ Examples:
                 debug=args.debug,
                 run_dir=run_dir,
                 pblock_ranges=args.pblock_ranges,
+                util_factor=args.pblock_util_factor,
             )
         else:
             print(f"Error: unknown strategy '{args.strategy}'", file=sys.stderr)
