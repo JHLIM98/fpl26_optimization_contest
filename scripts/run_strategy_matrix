@@ -29,8 +29,9 @@ BENCH_DIR_REL="fpl26_contest_benchmarks"
 OUTPUTS_DIR="${PROJECT_ROOT}/outputs"
 MATRIX_DIR="${OUTPUTS_DIR}/matrix"
 RESULT_DIR="${OUTPUTS_DIR}/result"
-SUMMARY="${OUTPUTS_DIR}/strategy_matrix_summary.tsv"
-SWEEP_LOG="${OUTPUTS_DIR}/strategy_matrix.log"
+# Allow override so partial reruns don't clobber the prior full-sweep summary.
+SUMMARY="${SUMMARY:-${OUTPUTS_DIR}/strategy_matrix_summary.tsv}"
+SWEEP_LOG="${SWEEP_LOG:-${OUTPUTS_DIR}/strategy_matrix.log}"
 
 mkdir -p "${MATRIX_DIR}" "${RESULT_DIR}"
 cd "${PROJECT_ROOT}"
@@ -40,21 +41,28 @@ SMALL_STRATEGIES="${SMALL_STRATEGIES:-baseline_runtime replace baseline_explore 
 LARGE_STRATEGIES="${LARGE_STRATEGIES:-baseline_runtime replace}"
 SIZE_THRESHOLD_MB="${SIZE_THRESHOLD_MB:-20}"   # >= this MB counts as "large"
 
+# Optional regex filters for partial reruns
+ONLY_DCP="${ONLY_DCP:-}"            # filename regex; empty => all
+ONLY_STRATEGY="${ONLY_STRATEGY:-}"  # strategy-name regex; empty => all
+
 # DCP list discovery (skip already-optimized files)
 mapfile -t ALL_DCPS < <(
     find "${BENCH_DIR_REL}" -maxdepth 1 -type f -name "*.dcp" ! -name "*_optimized*" ! -name "*_replace-*" \
          -printf "%s\t%P\n" | sort -n | awk -F'\t' '{print $2}'
 )
 
-# Map strategy name -> python invocation arg suffix
-strategy_args() {
+# Map strategy name -> (make_target, extra make var). We invoke through `make`
+# so that JAVA_HOME / CLASSPATH / PATH set by the Makefile propagate to the
+# Python child (and thence to the RapidWright JVM). Calling python3 directly
+# breaks RW initialization because those exports never reach the child.
+strategy_make_args() {
     case "$1" in
-        baseline_runtime)      echo "--baseline --phys-opt-directive RuntimeOptimized" ;;
-        baseline_default)      echo "--baseline --phys-opt-directive Default" ;;
-        baseline_explore)      echo "--baseline --phys-opt-directive Explore" ;;
-        baseline_aggr_explore) echo "--baseline --phys-opt-directive AggressiveExplore" ;;
-        baseline_aggr_fanout)  echo "--baseline --phys-opt-directive AggressiveFanoutOpt" ;;
-        replace)               echo "--strategy replace" ;;
+        baseline_runtime)      echo "run_baseline PHYS_OPT_DIRECTIVE=RuntimeOptimized" ;;
+        baseline_default)      echo "run_baseline PHYS_OPT_DIRECTIVE=Default" ;;
+        baseline_explore)      echo "run_baseline PHYS_OPT_DIRECTIVE=Explore" ;;
+        baseline_aggr_explore) echo "run_baseline PHYS_OPT_DIRECTIVE=AggressiveExplore" ;;
+        baseline_aggr_fanout)  echo "run_baseline PHYS_OPT_DIRECTIVE=AggressiveFanoutOpt" ;;
+        replace)               echo "run_strategy STRATEGY=replace" ;;
         *) echo ""; return 1 ;;
     esac
 }
@@ -82,6 +90,8 @@ printf "DCP\tSTRATEGY\tSTATUS\tINITIAL_FMAX\tFINAL_FMAX\tDELTA_MHZ\tROUTING_ERRO
     echo "Size threshold:    ${SIZE_THRESHOLD_MB} MB"
     echo "Small strategies:  ${SMALL_STRATEGIES}"
     echo "Large strategies:  ${LARGE_STRATEGIES}"
+    echo "Only DCP regex:    ${ONLY_DCP:-(none)}"
+    echo "Only strat regex:  ${ONLY_STRATEGY:-(none)}"
     echo "Summary:           ${SUMMARY}"
     echo "================================="
     echo ""
@@ -105,6 +115,14 @@ for dcp_name in "${ALL_DCPS[@]}"; do
     strategies=$(strategies_for_dcp "${dcp_path}")
 
     for strategy in ${strategies}; do
+        # Apply filters
+        if [ -n "${ONLY_DCP}" ] && ! [[ "${dcp_name}" =~ ${ONLY_DCP} ]]; then
+            continue
+        fi
+        if [ -n "${ONLY_STRATEGY}" ] && ! [[ "${strategy}" =~ ${ONLY_STRATEGY} ]]; then
+            continue
+        fi
+
         idx=$((idx + 1))
         timestamp="$(date +%Y%m%d_%H%M%S)"
         output_dcp="${RESULT_DIR}/${stem}_${strategy}-${timestamp}.dcp"
@@ -114,21 +132,25 @@ for dcp_name in "${ALL_DCPS[@]}"; do
         abs_output_dcp="${PROJECT_ROOT}/${output_dcp#${PROJECT_ROOT}/}"
         abs_run_dir="${PROJECT_ROOT}/${run_dir#${PROJECT_ROOT}/}"
 
-        suffix=$(strategy_args "${strategy}") || {
-            echo "[${idx}/${plan_count}] SKIP unknown strategy: ${strategy}" | tee -a "${SWEEP_LOG}"
+        make_args=$(strategy_make_args "${strategy}") || {
+            echo "[${idx}] SKIP unknown strategy: ${strategy}" | tee -a "${SWEEP_LOG}"
             continue
         }
+        # make_args looks like: "run_baseline PHYS_OPT_DIRECTIVE=Explore"
+        make_target=$(echo "${make_args}" | awk '{print $1}')
+        make_extra=$(echo "${make_args}" | cut -d' ' -f2-)
 
         {
             echo "----------------------------------------"
-            echo "[${idx}/${plan_count}] [$(date '+%F %T')] ${dcp_name}  ::  ${strategy}"
+            echo "[${idx}] [$(date '+%F %T')] ${dcp_name}  ::  ${strategy}"
             echo "  Output:  ${output_dcp}"
             echo "  Run dir: ${run_dir}"
             echo "  Log:     ${log_file}"
+            echo "  Make:    make ${make_target} DCP=... ${make_extra}"
         } | tee -a "${SWEEP_LOG}"
 
         start_ts=$(date +%s)
-        if python3 dcp_optimizer.py "${dcp_path}" --output "${abs_output_dcp}" --run-dir "${abs_run_dir}" ${suffix} \
+        if make ${make_target} DCP="${dcp_path}" OUTPUT="${abs_output_dcp}" RUN_DIR="${abs_run_dir}" ${make_extra} \
                 > "${log_file}" 2>&1; then
             status="OK"
         else
