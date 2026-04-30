@@ -350,7 +350,7 @@ run_strategy:
 		fi; \
 	fi; \
 	echo ""; \
-	$(PYTHON) dcp_optimizer.py "$(DCP)" $(if $(OUTPUT),--output "$(OUTPUT)") $(if $(RUN_DIR),--run-dir "$(RUN_DIR)") --strategy $(STRATEGY)
+	$(PYTHON) dcp_optimizer.py "$(DCP)" $(if $(OUTPUT),--output "$(OUTPUT)") $(if $(RUN_DIR),--run-dir "$(RUN_DIR)") --strategy $(STRATEGY) $(if $(PBLOCK_RANGES),--pblock-ranges "$(PBLOCK_RANGES)")
 
 # Validation target: Validate functional equivalence between two DCPs
 validate:

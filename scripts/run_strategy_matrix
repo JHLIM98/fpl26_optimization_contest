@@ -63,6 +63,7 @@ strategy_make_args() {
         baseline_aggr_explore) echo "run_baseline PHYS_OPT_DIRECTIVE=AggressiveExplore" ;;
         baseline_aggr_fanout)  echo "run_baseline PHYS_OPT_DIRECTIVE=AggressiveFanoutOpt" ;;
         replace)               echo "run_strategy STRATEGY=replace" ;;
+        pblock)                echo "run_strategy STRATEGY=pblock" ;;
         *) echo ""; return 1 ;;
     esac
 }
@@ -159,11 +160,11 @@ for dcp_name in "${ALL_DCPS[@]}"; do
         end_ts=$(date +%s)
         runtime=$((end_ts - start_ts))
 
-        # Parse metrics from per-experiment log (works for both baseline and replace)
-        if [ "${strategy}" = "replace" ]; then
+        # Parse metrics from per-experiment log (works for baseline / replace / pblock)
+        if [ "${strategy}" = "replace" ] || [ "${strategy}" = "pblock" ]; then
             initial_wns=$(grep -oP 'Initial WNS:\s+\K-?[\d.]+' "${log_file}" | head -1 || true)
             final_wns=$(grep -oP 'Final WNS:\s+\K-?[\d.]+'   "${log_file}" | head -1 || true)
-            clock_period=$(grep -oP 'Clock period:\s+\K[\d.]+' "${log_file}" | head -1 || true)
+            clock_period=$(grep -oP 'Clock period:\s+\K[\d.]+|clock_period=\K[\d.]+' "${log_file}" | head -1 || true)
             routing_errors=$(grep -oP 'Routing errors:\s+\K-?\d+' "${log_file}" | head -1 || true)
             # Compute Fmax from WNS + clock period
             if [ -n "${initial_wns:-}" ] && [ -n "${clock_period:-}" ]; then

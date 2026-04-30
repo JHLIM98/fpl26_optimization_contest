@@ -1983,6 +1983,203 @@ class FPGAOptimizerTest(DCPOptimizerBase):
             notes.append(f"Exception: {type(e).__name__}: {e}")
             return stats
 
+    async def try_pblock(
+        self,
+        input_dcp: Path,
+        output_dcp: Path,
+        pblock_ranges: Optional[str] = None,
+        place_directive: str = "Default",
+        route_directive: str = "Default",
+    ) -> dict:
+        """Benchmark-agnostic pblock area-constraint flow.
+
+        Walks the contest-recommended 8-step pipeline:
+            (1) Open DCP in Vivado, measure initial WNS
+            (2) Pull utilization (1.5x targets) for pblock sizing
+            (3) Initialize RapidWright, read DCP
+            (4) analyze_fabric_for_pblock -> col/row bounds
+            (5) convert_fabric_region_to_pblock -> Vivado pblock_ranges string
+            (6) Vivado: place_design -unplace + create_and_apply_pblock
+            (7) Vivado: place_design + route_design under the constraint
+            (8) Final timing, write checkpoint
+
+        If `pblock_ranges` is provided, steps (2)/(4)/(5) are skipped and the
+        provided string is applied directly (useful for known-optimal ranges
+        like LogicNets's SLICE_X55Y60:SLICE_X111Y254).
+
+        Assumes start_servers() has been called by the caller. Returns
+        structured stats so a matrix sweep / dispatcher can branch on result.
+        """
+        notes = []
+        stats = {
+            "success": False,
+            "initial_wns": None,
+            "final_wns": None,
+            "clock_period": None,
+            "pblock_ranges": pblock_ranges,
+            "routing_errors": -1,
+            "notes": notes,
+        }
+
+        try:
+            # ---- STEP 1: open + initial WNS ----
+            await self.call_vivado_tool("open_checkpoint", {
+                "dcp_path": str(input_dcp.resolve())
+            }, timeout=600.0)
+
+            self.clock_period = await self.fetch_clock_period()
+            target_wns = await self.get_wns_for_target_clock(self._call_vivado_for_clock)
+            if target_wns is not None:
+                self.initial_wns = target_wns
+            else:
+                ts = await self.call_vivado_tool("report_timing_summary", {}, timeout=300.0)
+                self.initial_wns = self.parse_wns_from_timing_report(ts)
+            stats["initial_wns"] = self.initial_wns
+            stats["clock_period"] = self.clock_period
+            notes.append(f"Initial WNS={self.initial_wns} clock_period={self.clock_period}")
+
+            # ---- STEPs 2-5: auto-derive pblock_ranges if not supplied ----
+            if pblock_ranges is None:
+                # (2) Utilization. Bypass report_utilization_for_pblock (its
+                # FF parser miscounts on at least some designs - silently
+                # zeroes out the count) by calling raw report_utilization and
+                # parsing with our own regex. We then apply the 1.5x multiplier
+                # ourselves.
+                util_raw = await self.call_vivado_tool("run_tcl", {
+                    "command": "report_utilization -return_string"
+                }, timeout=300.0)
+                if not isinstance(util_raw, str):
+                    util_raw = str(util_raw)
+
+                def _grab_used(label_pattern: str) -> int:
+                    m = re.search(
+                        r"\|\s*" + label_pattern + r"\s*\|\s*([\d,]+)",
+                        util_raw,
+                    )
+                    if not m:
+                        return 0
+                    try:
+                        return int(m.group(1).replace(",", ""))
+                    except (TypeError, ValueError):
+                        return 0
+
+                used_lut  = _grab_used(r"(?:Slice LUTs|CLB LUTs|LUT as Logic)")
+                used_ff   = _grab_used(r"(?:Register as Flip Flop|Slice Registers|CLB Registers)")
+                used_dsp  = _grab_used(r"DSPs")
+                used_bram = _grab_used(r"Block RAM Tile")
+                if used_lut == 0:
+                    notes.append(
+                        f"Could not parse utilization (LUT used = 0); "
+                        f"snippet={util_raw[:300]!r}"
+                    )
+                    return stats
+                target_lut  = int(used_lut  * 1.5)
+                target_ff   = int(used_ff   * 1.5)
+                target_dsp  = int(used_dsp  * 1.5)
+                target_bram = int(used_bram * 1.5)
+                notes.append(f"Used: LUT={used_lut} FF={used_ff} DSP={used_dsp} BRAM={used_bram}")
+                notes.append(f"Targets (1.5x): LUT={target_lut} FF={target_ff} DSP={target_dsp} BRAM={target_bram}")
+
+                # (3) RapidWright init + read
+                await self.call_rapidwright_tool("initialize_rapidwright", {
+                    "jvm_max_memory": "8G"
+                }, timeout=120.0)
+                await self.call_rapidwright_tool("read_checkpoint", {
+                    "dcp_path": str(input_dcp.resolve())
+                }, timeout=600.0)
+
+                # (4) analyze_fabric_for_pblock -> col/row bounds
+                fabric_args = {
+                    "target_lut_count": target_lut,
+                    "target_ff_count": target_ff,
+                }
+                if target_dsp > 0:
+                    fabric_args["target_dsp_count"] = target_dsp
+                if target_bram > 0:
+                    fabric_args["target_bram_count"] = target_bram
+                fabric_result = await self.call_rapidwright_tool(
+                    "analyze_fabric_for_pblock", fabric_args, timeout=300.0
+                )
+                fabric = self._parse_json_text(fabric_result) if isinstance(fabric_result, str) else fabric_result
+                if not isinstance(fabric, dict) or "error" in fabric:
+                    notes.append(f"analyze_fabric_for_pblock failed: {str(fabric)[:300]}")
+                    return stats
+                # The bounds live in fabric["recommended_region"] per the RW tool spec.
+                region = fabric.get("recommended_region") or {}
+                try:
+                    col_min = int(region.get("col_min"))
+                    col_max = int(region.get("col_max"))
+                    row_min = int(region.get("row_min"))
+                    row_max = int(region.get("row_max"))
+                except (TypeError, ValueError):
+                    notes.append(f"recommended_region missing col/row bounds: {str(region)[:200]}")
+                    return stats
+                notes.append(f"Fabric region: col[{col_min},{col_max}] row[{row_min},{row_max}]")
+
+                # (5) convert_fabric_region_to_pblock -> Vivado ranges string
+                conv_result = await self.call_rapidwright_tool(
+                    "convert_fabric_region_to_pblock", {
+                        "col_min": col_min, "col_max": col_max,
+                        "row_min": row_min, "row_max": row_max,
+                    }, timeout=120.0
+                )
+                conv = self._parse_json_text(conv_result) if isinstance(conv_result, str) else conv_result
+                pblock_ranges = (conv.get("pblock_ranges") if isinstance(conv, dict) else None) or \
+                                (conv_result.strip() if isinstance(conv_result, str) else None)
+                if not pblock_ranges:
+                    notes.append(f"convert_fabric_region_to_pblock returned no string: {str(conv)[:200]}")
+                    return stats
+                stats["pblock_ranges"] = pblock_ranges
+                notes.append(f"Auto pblock_ranges: {pblock_ranges[:120]}{'...' if len(pblock_ranges) > 120 else ''}")
+            else:
+                notes.append(f"Using supplied pblock_ranges: {pblock_ranges[:120]}{'...' if len(pblock_ranges) > 120 else ''}")
+
+            # ---- STEP 6: unplace + apply pblock ----
+            await self.call_vivado_tool("run_tcl", {
+                "command": "place_design -unplace"
+            }, timeout=300.0)
+            await self.call_vivado_tool("create_and_apply_pblock", {
+                "pblock_name": "pblock_opt_auto",
+                "ranges": pblock_ranges,
+                "apply_to": "current_design",
+                "is_soft": False,
+            }, timeout=300.0)
+
+            # ---- STEP 7: place + route under constraint ----
+            await self.call_vivado_tool("place_design", {
+                "directive": place_directive,
+            }, timeout=3600.0)
+            await self.call_vivado_tool("route_design", {
+                "directive": route_directive,
+            }, timeout=3600.0)
+
+            route_status = await self.call_vivado_tool("report_route_status", {}, timeout=300.0)
+            error_match = re.search(r"# of nets with routing errors.*?:\s+(\d+)", route_status)
+            stats["routing_errors"] = int(error_match.group(1)) if error_match else -1
+
+            # ---- STEP 8: final timing + write ----
+            target_wns = await self.get_wns_for_target_clock(self._call_vivado_for_clock)
+            if target_wns is not None:
+                self.final_wns = target_wns
+            else:
+                ts = await self.call_vivado_tool("report_timing_summary", {}, timeout=300.0)
+                self.final_wns = self.parse_wns_from_timing_report(ts)
+            stats["final_wns"] = self.final_wns
+            notes.append(f"Final WNS={self.final_wns}")
+
+            await self.call_vivado_tool("write_checkpoint", {
+                "dcp_path": str(output_dcp.resolve()),
+                "force": True,
+            }, timeout=600.0)
+
+            stats["success"] = True
+            return stats
+
+        except Exception as e:
+            logger.exception(f"try_pblock failed: {e}")
+            notes.append(f"Exception: {type(e).__name__}: {e}")
+            return stats
+
     async def run_test(self, input_dcp: Path, output_dcp: Path, max_nets_to_optimize: int = 5) -> bool:
         """
         Run the deterministic test optimization flow.
@@ -2822,6 +3019,50 @@ async def run_baseline_mode(
         await tester.cleanup()
 
 
+async def run_pblock_mode(
+    input_dcp: Path,
+    output_dcp: Path,
+    debug: bool = False,
+    run_dir: Optional[Path] = None,
+    pblock_ranges: Optional[str] = None,
+):
+    """Run the pblock-based area-constraint strategy in isolation."""
+    tester = FPGAOptimizerTest(debug=debug, run_dir=run_dir)
+
+    try:
+        await tester.start_servers()
+        stats = await tester.try_pblock(input_dcp, output_dcp, pblock_ranges=pblock_ranges)
+
+        for note in stats["notes"]:
+            print(f"[PBLOCK] {note}")
+
+        if stats["success"]:
+            print("\n[PBLOCK] Pblock optimization completed successfully")
+            print(f"[PBLOCK]   Initial WNS:    {stats['initial_wns']}")
+            print(f"[PBLOCK]   Final WNS:      {stats['final_wns']}")
+            print(f"[PBLOCK]   Pblock ranges:  {stats['pblock_ranges']}")
+            print(f"[PBLOCK]   Routing errors: {stats['routing_errors']}")
+            print(f"[PBLOCK]   Output DCP:     {output_dcp}")
+            print(f"[PBLOCK]   Run directory:  {tester.run_dir}")
+            return 0
+
+        print("\n[PBLOCK] Pblock optimization failed")
+        print(f"[PBLOCK] Run directory: {tester.run_dir}")
+        return 1
+
+    except KeyboardInterrupt:
+        print("\n[PBLOCK] Interrupted by user")
+        print(f"[PBLOCK] Run directory: {tester.run_dir}")
+        return 130
+    except Exception as e:
+        logger.exception(f"Pblock mode fatal error: {e}")
+        print(f"\n[PBLOCK] Fatal error: {e}")
+        print(f"[PBLOCK] Run directory: {tester.run_dir}")
+        return 1
+    finally:
+        await tester.cleanup()
+
+
 async def run_replace_mode(
     input_dcp: Path,
     output_dcp: Path,
@@ -2921,11 +3162,18 @@ Examples:
     )
     parser.add_argument(
         "--strategy",
-        choices=["replace"],
+        choices=["replace", "pblock"],
         default=None,
         help="Run a single benchmark-agnostic strategy in isolation (no LLM). "
              "'replace' = RapidWright cell re-placement (detour analysis + centroid placement + reroute). "
-             "More strategies (pblock, fanout, phys_opt) will be added."
+             "'pblock' = Vivado pblock area constraint (auto-derived ranges via RW analyze_fabric_for_pblock; "
+             "override with --pblock-ranges)."
+    )
+    parser.add_argument(
+        "--pblock-ranges",
+        default=None,
+        help="Optional pblock range string (e.g. 'SLICE_X55Y60:SLICE_X111Y254') for --strategy pblock. "
+             "If omitted, ranges are auto-derived from utilization + RW fabric analysis."
     )
     parser.add_argument(
         "--phys-opt-directive",
@@ -3043,6 +3291,14 @@ Examples:
                 args.output_dcp,
                 debug=args.debug,
                 run_dir=run_dir,
+            )
+        elif args.strategy == "pblock":
+            exit_code = await run_pblock_mode(
+                args.input_dcp,
+                args.output_dcp,
+                debug=args.debug,
+                run_dir=run_dir,
+                pblock_ranges=args.pblock_ranges,
             )
         else:
             print(f"Error: unknown strategy '{args.strategy}'", file=sys.stderr)
