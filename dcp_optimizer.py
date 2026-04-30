@@ -1974,6 +1974,13 @@ class FPGAOptimizerTest(DCPOptimizerBase):
                 "dcp_path": str(output_dcp.resolve()),
                 "force": True
             }, timeout=600.0)
+            # Validation Phase 1 reopens the DCP in RapidWright, which needs a
+            # readable EDIF alongside the checkpoint.
+            edif_path = output_dcp.with_suffix(".edf")
+            await self.call_vivado_tool("write_edif", {
+                "edif_path": str(edif_path.resolve()),
+                "force": True
+            }, timeout=600.0)
 
             stats["success"] = True
             return stats
@@ -2170,6 +2177,13 @@ class FPGAOptimizerTest(DCPOptimizerBase):
 
             await self.call_vivado_tool("write_checkpoint", {
                 "dcp_path": str(output_dcp.resolve()),
+                "force": True,
+            }, timeout=600.0)
+            # Validation Phase 1 reopens the DCP in RapidWright, which needs a
+            # readable EDIF alongside the checkpoint.
+            edif_path = output_dcp.with_suffix(".edf")
+            await self.call_vivado_tool("write_edif", {
+                "edif_path": str(edif_path.resolve()),
                 "force": True,
             }, timeout=600.0)
 
