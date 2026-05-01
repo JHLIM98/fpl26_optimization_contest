@@ -67,7 +67,7 @@ help:
 	@echo "Available targets:"
 	@echo "  setup              - Install dependencies, build RapidWright, download example DCPs"
 	@echo "  build-rapidwright  - Build RapidWright from source (git submodule)"
-	@echo "  run_optimizer      - Run optimizer on a DCP file (LLM-guided, requires API key)"
+	@echo "  run_optimizer      - Run optimizer on a DCP (default: deterministic dispatcher; LLM=1 opts into LLM mode)"
 	@echo "  run_test           - Run optimizer in test mode (no LLM, hardcoded optimization)"
 	@echo "  run_baseline       - Run deterministic fallback baseline on a DCP file (no LLM)"
 	@echo "  run_strategy       - Run a single named optimization strategy in isolation (e.g. STRATEGY=replace)"
@@ -95,6 +95,7 @@ help:
 	@echo "  STRATEGY        - Strategy name for run_strategy target (e.g. 'replace')"
 	@echo "  OUTPUT          - Optional output DCP path"
 	@echo "  RUN_DIR         - Optional run directory for logs and intermediate files"
+	@echo "  LLM             - Set LLM=1 with run_optimizer to opt into LLM-guided mode"
 	@echo "  MAX_NETS        - Max high fanout nets to optimize in non-LLM modes (default: 5)"
 	@echo "  GOLDEN          - Golden (reference) DCP for validation"
 	@echo "  REVISED         - Revised (optimized) DCP for validation"
@@ -247,7 +248,7 @@ run_optimizer:
 		fi; \
 	fi; \
 	echo ""; \
-	$(PYTHON) dcp_optimizer.py "$(DCP)" $(if $(OUTPUT),--output "$(OUTPUT)") $(if $(RUN_DIR),--run-dir "$(RUN_DIR)")
+	$(PYTHON) dcp_optimizer.py "$(DCP)" $(if $(OUTPUT),--output "$(OUTPUT)") $(if $(RUN_DIR),--run-dir "$(RUN_DIR)") $(if $(LLM),--llm)
 
 # Run test mode: Run dcp_optimizer.py with --test flag (no LLM required)
 run_test:

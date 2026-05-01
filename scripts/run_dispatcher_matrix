@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+#
+# Run the deterministic dispatcher (default mode of dcp_optimizer.py) on each
+# benchmark and write a summary TSV matching scripts/run_strategy_matrix's
+# format so the two can be compared directly.
+#
+# Usage:
+#   scripts/run_dispatcher_matrix                     # all DCPs
+#   ONLY_DCP='vexriscv|3d-rendering' \
+#     scripts/run_dispatcher_matrix                   # filter by filename regex
+#   SUMMARY=outputs/dispatcher_matrix_smoke.tsv \
+#     scripts/run_dispatcher_matrix                   # custom summary path
+#
+# Output layout (under outputs/):
+#   matrix/<dcp_stem>-dispatcher-<ts>.log         per-experiment optimizer stdout
+#   matrix/<dcp_stem>-dispatcher-<ts>/            per-experiment run dir
+#   result/<dcp_stem>_dispatcher-<ts>.dcp         optimized DCP
+#   dispatcher_matrix_summary.tsv                 summary table
+#   dispatcher_matrix.log                         sweep progress log
+#
+# The TSV columns line up with strategy_matrix_summary.tsv so a quick join /
+# diff confirms that dispatcher tracks the per-DCP matrix winner.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+BENCH_DIR_REL="fpl26_contest_benchmarks"
+OUTPUTS_DIR="${PROJECT_ROOT}/outputs"
+MATRIX_DIR="${OUTPUTS_DIR}/matrix"
+RESULT_DIR="${OUTPUTS_DIR}/result"
+SUMMARY="${SUMMARY:-${OUTPUTS_DIR}/dispatcher_matrix_summary.tsv}"
+SWEEP_LOG="${SWEEP_LOG:-${OUTPUTS_DIR}/dispatcher_matrix.log}"
+
+mkdir -p "${MATRIX_DIR}" "${RESULT_DIR}"
+cd "${PROJECT_ROOT}"
+
+ONLY_DCP="${ONLY_DCP:-}"
+
+mapfile -t ALL_DCPS < <(
+    find "${BENCH_DIR_REL}" -maxdepth 1 -type f -name "*.dcp" \
+         ! -name "*_optimized*" ! -name "*_replace-*" ! -name "*_dispatcher-*" \
+         -printf "%s\t%P\n" | sort -n | awk -F'\t' '{print $2}'
+)
+
+printf "DCP\tSTRATEGY\tSTATUS\tINITIAL_FMAX\tFINAL_FMAX\tDELTA_MHZ\tSELECTED\tRUNTIME_S\n" > "${SUMMARY}"
+: > "${SWEEP_LOG}"
+
+{
+    echo "===== Dispatcher Matrix Sweep ====="
+    echo "Started:        $(date '+%F %T')"
+    echo "DCPs found:     ${#ALL_DCPS[@]}"
+    echo "Only DCP regex: ${ONLY_DCP:-(none)}"
+    echo "Summary:        ${SUMMARY}"
+    echo "==================================="
+    echo ""
+} | tee -a "${SWEEP_LOG}"
+
+idx=0
+for dcp_name in "${ALL_DCPS[@]}"; do
+    if [ -n "${ONLY_DCP}" ] && ! [[ "${dcp_name}" =~ ${ONLY_DCP} ]]; then
+        continue
+    fi
+
+    dcp_path="${BENCH_DIR_REL}/${dcp_name}"
+    stem="${dcp_name%.dcp}"
+    idx=$((idx + 1))
+    timestamp="$(date +%Y%m%d_%H%M%S)"
+    output_dcp="${RESULT_DIR}/${stem}_dispatcher-${timestamp}.dcp"
+    run_dir="${MATRIX_DIR}/${stem}-dispatcher-${timestamp}"
+    log_file="${MATRIX_DIR}/${stem}-dispatcher-${timestamp}.log"
+    abs_output_dcp="${PROJECT_ROOT}/${output_dcp#${PROJECT_ROOT}/}"
+    abs_run_dir="${PROJECT_ROOT}/${run_dir#${PROJECT_ROOT}/}"
+
+    {
+        echo "----------------------------------------"
+        echo "[${idx}] [$(date '+%F %T')] ${dcp_name}  ::  dispatcher"
+        echo "  Output:  ${output_dcp}"
+        echo "  Run dir: ${run_dir}"
+        echo "  Log:     ${log_file}"
+    } | tee -a "${SWEEP_LOG}"
+
+    start_ts=$(date +%s)
+    # `make run_optimizer` defaults to the dispatcher (LLM is opt-in via LLM=1).
+    # We invoke through make so JAVA_HOME/CLASSPATH/PATH propagate.
+    if make run_optimizer DCP="${dcp_path}" OUTPUT="${abs_output_dcp}" RUN_DIR="${abs_run_dir}" \
+            > "${log_file}" 2>&1; then
+        status="OK"
+    else
+        status="FAIL"
+    fi
+    end_ts=$(date +%s)
+    runtime=$((end_ts - start_ts))
+
+    initial_fmax=$(grep -oP 'Initial Fmax:\s+\K[\d.]+' "${log_file}" | head -1 || true)
+    final_fmax=$(grep -oP 'Final Fmax:\s+\K[\d.]+'   "${log_file}" | head -1 || true)
+    delta=$(grep -oP 'Fmax Improvement:\s+\+?\K-?[\d.]+' "${log_file}" | head -1 || true)
+    # Dispatcher prints a "selected: <strategy>" line in its summary block.
+    selected=$(grep -oP 'selected:\s+\K[\w()_+\-]+' "${log_file}" | tail -1 || true)
+    initial_fmax="${initial_fmax:-N/A}"
+    final_fmax="${final_fmax:-N/A}"
+    delta="${delta:-N/A}"
+    selected="${selected:-N/A}"
+
+    line="$(printf "%s\tdispatcher\t%s\t%s\t%s\t%s\t%s\t%d" "${dcp_name}" "${status}" "${initial_fmax}" "${final_fmax}" "${delta}" "${selected}" "${runtime}")"
+    echo "${line}" >> "${SUMMARY}"
+    echo "  -> ${status}  initial=${initial_fmax}  final=${final_fmax}  delta=${delta}  selected=${selected}  runtime=${runtime}s" | tee -a "${SWEEP_LOG}"
+    echo "" | tee -a "${SWEEP_LOG}"
+done
+
+{
+    echo "===== Dispatcher Matrix Sweep COMPLETE ====="
+    echo "Finished: $(date '+%F %T')"
+    echo ""
+    if command -v column >/dev/null 2>&1; then
+        column -t -s $'\t' "${SUMMARY}"
+    else
+        cat "${SUMMARY}"
+    fi
+} | tee -a "${SWEEP_LOG}"

@@ -1836,6 +1836,139 @@ class FPGAOptimizerTest(DCPOptimizerBase):
             print(f"Exception: {type(e).__name__}: {e}")
             return False
 
+    async def analyze_design_characteristics(self, input_dcp: Path) -> dict:
+        """Sample initial timing, utilization, fanout structure, and critical-path
+        spread for the given DCP. Returns a dict the dispatcher uses to pick a
+        strategy. Best-effort: each subsection swallows its own exceptions and
+        records a note.
+
+        Assumes start_servers() has been called by the caller.
+        """
+        notes: list[str] = []
+        info = {
+            "initial_wns": None,
+            "clock_period": None,
+            "used_lut": 0,
+            "used_ff": 0,
+            "used_dsp": 0,
+            "used_bram": 0,
+            "max_spread_distance": None,
+            "avg_spread_distance": None,
+            "paths_analyzed": 0,
+            "fanout_candidate_count": 0,
+            "top_fanout_max": 0,
+            "notes": notes,
+        }
+
+        # ---- (1) Open + initial timing ----
+        try:
+            await self.call_vivado_tool("open_checkpoint", {
+                "dcp_path": str(input_dcp.resolve())
+            }, timeout=600.0)
+            self.clock_period = await self.fetch_clock_period()
+            info["clock_period"] = self.clock_period
+            target_wns = await self.get_wns_for_target_clock(self._call_vivado_for_clock)
+            if target_wns is not None:
+                self.initial_wns = target_wns
+            else:
+                ts = await self.call_vivado_tool("report_timing_summary", {}, timeout=300.0)
+                self.initial_wns = self.parse_wns_from_timing_report(ts)
+            info["initial_wns"] = self.initial_wns
+            notes.append(f"Initial WNS={self.initial_wns} clock_period={self.clock_period}")
+        except Exception as e:
+            logger.warning(f"analyze: initial timing failed: {e}")
+            notes.append(f"Initial timing failed: {e}")
+            return info
+
+        # ---- (2) Utilization ----
+        try:
+            util_raw = await self.call_vivado_tool("run_tcl", {
+                "command": "report_utilization -return_string"
+            }, timeout=300.0)
+            if not isinstance(util_raw, str):
+                util_raw = str(util_raw)
+
+            def _grab(label_pattern: str) -> int:
+                m = re.search(r"\|\s*" + label_pattern + r"\s*\|\s*([\d,]+)", util_raw)
+                if not m:
+                    return 0
+                try:
+                    return int(m.group(1).replace(",", ""))
+                except (TypeError, ValueError):
+                    return 0
+
+            info["used_lut"]  = _grab(r"(?:Slice LUTs|CLB LUTs|LUT as Logic)")
+            info["used_ff"]   = _grab(r"(?:Register as Flip Flop|Slice Registers|CLB Registers)")
+            info["used_dsp"]  = _grab(r"DSPs")
+            info["used_bram"] = _grab(r"Block RAM Tile")
+            notes.append(
+                f"Util LUT={info['used_lut']} FF={info['used_ff']} "
+                f"DSP={info['used_dsp']} BRAM={info['used_bram']}"
+            )
+        except Exception as e:
+            logger.warning(f"analyze: utilization parse failed: {e}")
+            notes.append(f"Utilization parse failed: {e}")
+
+        # ---- (3) High-fanout candidate inventory ----
+        try:
+            nets_report = await self.call_vivado_tool("get_critical_high_fanout_nets", {
+                "num_paths": 30,
+                "min_fanout": 80,
+                "exclude_clocks": True,
+            }, timeout=600.0)
+            high_nets = self.parse_high_fanout_nets(nets_report) or []
+            strong = [
+                (name, fanout, paths)
+                for (name, fanout, paths) in high_nets
+                if fanout >= 100 and paths >= 2
+            ]
+            info["fanout_candidate_count"] = len(strong)
+            info["top_fanout_max"] = max((f for _, f, _ in high_nets), default=0)
+            notes.append(
+                f"Fanout candidates (>=100 fanout, >=2 paths)={len(strong)} "
+                f"top_fanout={info['top_fanout_max']}"
+            )
+        except Exception as e:
+            logger.warning(f"analyze: fanout query failed: {e}")
+            notes.append(f"Fanout query failed: {e}")
+
+        # ---- (4) RapidWright critical-path spread ----
+        try:
+            rw_init = await self.call_rapidwright_tool("initialize_rapidwright", {
+                "jvm_max_memory": "8G"
+            }, timeout=120.0)
+            rw_init_json = self._parse_json_text(rw_init)
+            if rw_init_json.get("status") in {"success", "already_initialized"}:
+                await self.call_rapidwright_tool("read_checkpoint", {
+                    "dcp_path": str(input_dcp.resolve())
+                }, timeout=600.0)
+                cells_file = Path(self.temp_dir) / "dispatcher_critical_path_cells.json"
+                await self.call_vivado_tool("extract_critical_path_cells", {
+                    "num_paths": 50,
+                    "output_file": str(cells_file),
+                }, timeout=600.0)
+                spread_raw = await self.call_rapidwright_tool("analyze_critical_path_spread", {
+                    "input_file": str(cells_file)
+                }, timeout=300.0)
+                spread = self._parse_json_text(spread_raw) if isinstance(spread_raw, str) else spread_raw
+                if isinstance(spread, dict) and "error" not in spread:
+                    info["max_spread_distance"] = spread.get("max_distance_found")
+                    info["avg_spread_distance"] = spread.get("avg_max_distance")
+                    info["paths_analyzed"] = spread.get("paths_analyzed", 0) or 0
+                    notes.append(
+                        f"Spread max={info['max_spread_distance']} "
+                        f"avg={info['avg_spread_distance']} paths={info['paths_analyzed']}"
+                    )
+                else:
+                    notes.append(f"Spread analysis returned no data: {str(spread)[:200]}")
+            else:
+                notes.append("RapidWright unavailable; skipped spread analysis")
+        except Exception as e:
+            logger.warning(f"analyze: spread analysis failed: {e}")
+            notes.append(f"Spread analysis failed: {e}")
+
+        return info
+
     async def try_cell_replacement(
         self,
         input_dcp: Path,
@@ -3126,6 +3259,267 @@ async def run_replace_mode(
         await tester.cleanup()
 
 
+def _dispatcher_pick_primary(info: dict, small_lut_threshold: int) -> str:
+    """Choose the primary deterministic strategy from analyze() output.
+
+    Matrix sweep showed pblock wins on 10/12 benchmarks; the two exceptions
+    (vexriscv ~3K LUT, 3d-rendering ~3K LUT) are small/fanout-heavy designs
+    where AggressiveFanoutOpt-flavored phys_opt outperforms area constraint.
+    """
+    used_lut = int(info.get("used_lut") or 0)
+    fanout_cands = int(info.get("fanout_candidate_count") or 0)
+    if 0 < used_lut < small_lut_threshold:
+        return "fanout"
+    # Catch fanout-dominated designs that happen to be a bit larger than
+    # the small-LUT threshold but still respond best to phys_opt fanout
+    # rebalancing (heuristic; pblock will run as the fallback regardless).
+    if fanout_cands >= 5 and used_lut < 2 * small_lut_threshold:
+        return "fanout"
+    return "pblock"
+
+
+async def _dispatcher_run_strategy(
+    tester: "FPGAOptimizerTest",
+    strategy: str,
+    input_dcp: Path,
+    output_dcp: Path,
+    util_factor: float,
+    phys_opt_directive: str,
+) -> dict:
+    """Run one dispatcher candidate strategy and normalize the result dict."""
+    if strategy == "pblock":
+        stats = await tester.try_pblock(
+            input_dcp, output_dcp, util_factor=util_factor
+        )
+        return {
+            "strategy": "pblock",
+            "success": bool(stats.get("success")) and output_dcp.exists(),
+            "final_wns": stats.get("final_wns"),
+            "notes": list(stats.get("notes") or []),
+        }
+    if strategy == "fanout":
+        ok = await tester.run_deterministic_baseline(
+            input_dcp,
+            output_dcp,
+            max_nets_to_optimize=2,
+            phys_opt_directive=phys_opt_directive,
+        )
+        return {
+            "strategy": f"fanout({phys_opt_directive})",
+            "success": bool(ok) and output_dcp.exists(),
+            "final_wns": tester.final_wns,
+            "notes": [],
+        }
+    if strategy == "bl_runtime":
+        ok = await tester.run_deterministic_baseline(
+            input_dcp,
+            output_dcp,
+            max_nets_to_optimize=2,
+            phys_opt_directive="RuntimeOptimized",
+        )
+        return {
+            "strategy": "bl_runtime",
+            "success": bool(ok) and output_dcp.exists(),
+            "final_wns": tester.final_wns,
+            "notes": [],
+        }
+    return {"strategy": strategy, "success": False, "final_wns": None, "notes": [f"Unknown strategy: {strategy}"]}
+
+
+async def _dispatcher_emit_passthrough(
+    tester: "FPGAOptimizerTest",
+    input_dcp: Path,
+    output_dcp: Path,
+) -> None:
+    """Copy the original DCP to output_dcp and emit a matching .edf so the
+    validator's RapidWright phase 1 read works."""
+    shutil.copyfile(input_dcp, output_dcp)
+    try:
+        await tester.call_vivado_tool("open_checkpoint", {
+            "dcp_path": str(output_dcp.resolve())
+        }, timeout=600.0)
+        await tester.call_vivado_tool("write_edif", {
+            "edif_path": str(output_dcp.with_suffix(".edf").resolve()),
+            "force": True,
+        }, timeout=600.0)
+    except Exception as e:
+        logger.warning(f"Passthrough EDIF write failed: {e}")
+        print(f"[DISPATCH] EDIF write skipped: {e}")
+
+
+async def run_dispatcher_mode(
+    input_dcp: Path,
+    output_dcp: Path,
+    debug: bool = False,
+    run_dir: Optional[Path] = None,
+    util_factor: float = 1.5,
+    small_lut_threshold: int = 5000,
+    fanout_phys_opt_directive: str = "AggressiveFanoutOpt",
+):
+    """Deterministic dispatcher: analyze the design, pick a primary strategy,
+    fall back to RuntimeOptimized phys_opt if the primary regresses, and
+    always emit a final DCP (+ .edf for the validator).
+    """
+    tester = FPGAOptimizerTest(debug=debug, run_dir=run_dir)
+    overall_start = time.time()
+
+    def _emit_summary(selected_label: str, final_wns: Optional[float]) -> None:
+        elapsed = time.time() - overall_start
+        tester.print_test_summary(
+            title="TEST SUMMARY - DISPATCHER",
+            elapsed_seconds=elapsed,
+            initial_wns=tester.initial_wns,
+            final_wns=final_wns,
+            clock_period=tester.clock_period,
+            extra_info=f"Strategy: {selected_label}"
+        )
+
+    try:
+        await tester.start_servers()
+
+        print("\n" + "=" * 70)
+        print("DISPATCHER MODE - design analysis")
+        print("=" * 70)
+        info = await tester.analyze_design_characteristics(input_dcp)
+        for note in info["notes"]:
+            print(f"[DISPATCH] {note}")
+
+        initial_wns = info.get("initial_wns")
+        if initial_wns is None:
+            print("[DISPATCH] Could not measure initial WNS; emitting original DCP unchanged")
+            await _dispatcher_emit_passthrough(tester, input_dcp, output_dcp)
+            _emit_summary("passthrough (no initial WNS)", None)
+            return 1
+
+        if initial_wns >= 0:
+            print(f"[DISPATCH] Initial WNS={initial_wns:.3f} >= 0 (timing met); emitting original DCP unchanged")
+            await _dispatcher_emit_passthrough(tester, input_dcp, output_dcp)
+            _emit_summary("passthrough (timing met)", initial_wns)
+            return 0
+
+        primary = _dispatcher_pick_primary(info, small_lut_threshold=small_lut_threshold)
+        print(
+            f"[DISPATCH] Primary strategy: {primary} "
+            f"(LUT={info.get('used_lut')}, fanout_cands={info.get('fanout_candidate_count')}, "
+            f"avg_spread={info.get('avg_spread_distance')})"
+        )
+
+        candidates: list[dict] = []
+
+        # ---- Run primary strategy ----
+        primary_dcp = Path(tester.temp_dir) / "dispatcher_primary.dcp"
+        print("\n" + "-" * 60)
+        print(f"DISPATCH STEP A: primary strategy = {primary}")
+        print("-" * 60)
+        primary_result = await _dispatcher_run_strategy(
+            tester, primary, input_dcp, primary_dcp,
+            util_factor=util_factor,
+            phys_opt_directive=fanout_phys_opt_directive,
+        )
+        primary_result["dcp"] = primary_dcp if primary_result.get("success") else None
+        candidates.append(primary_result)
+        for note in primary_result["notes"]:
+            print(f"[DISPATCH] {primary_result['strategy']}: {note}")
+        print(
+            f"[DISPATCH] {primary_result['strategy']}: "
+            f"success={primary_result['success']} final_wns={primary_result['final_wns']}"
+        )
+
+        primary_improved = (
+            primary_result.get("success")
+            and primary_result.get("final_wns") is not None
+            and primary_result["final_wns"] > initial_wns
+        )
+
+        # ---- Fallback: bl_runtime ----
+        if not primary_improved:
+            print("\n" + "-" * 60)
+            print("DISPATCH STEP B: fallback strategy = bl_runtime (RuntimeOptimized)")
+            print("-" * 60)
+            fallback_dcp = Path(tester.temp_dir) / "dispatcher_fallback.dcp"
+            fallback_result = await _dispatcher_run_strategy(
+                tester, "bl_runtime", input_dcp, fallback_dcp,
+                util_factor=util_factor,
+                phys_opt_directive="RuntimeOptimized",
+            )
+            fallback_result["dcp"] = fallback_dcp if fallback_result.get("success") else None
+            candidates.append(fallback_result)
+            print(
+                f"[DISPATCH] {fallback_result['strategy']}: "
+                f"success={fallback_result['success']} final_wns={fallback_result['final_wns']}"
+            )
+
+        # ---- Pick best ----
+        scored = [
+            c for c in candidates
+            if c.get("success") and c.get("final_wns") is not None and c.get("dcp") is not None
+        ]
+        scored.sort(key=lambda c: c["final_wns"], reverse=True)
+
+        if not scored or scored[0]["final_wns"] <= initial_wns:
+            print(
+                f"[DISPATCH] No strategy improved on initial WNS={initial_wns:.3f}; "
+                f"emitting original DCP unchanged"
+            )
+            await _dispatcher_emit_passthrough(tester, input_dcp, output_dcp)
+            print("\n" + "=" * 70)
+            print("DISPATCH SUMMARY")
+            print("=" * 70)
+            for c in candidates:
+                print(f"  {c['strategy']}: success={c['success']} final_wns={c['final_wns']}")
+            print(f"  selected: passthrough (initial_wns={initial_wns})")
+            _emit_summary("passthrough (no improvement)", initial_wns)
+            return 0
+
+        best = scored[0]
+        print(
+            f"\n[DISPATCH] Best strategy: {best['strategy']} "
+            f"(final WNS={best['final_wns']:.3f}, initial={initial_wns:.3f}, "
+            f"delta_wns={best['final_wns'] - initial_wns:+.3f} ns)"
+        )
+
+        shutil.copyfile(best["dcp"], output_dcp)
+        best_edif = best["dcp"].with_suffix(".edf")
+        out_edif = output_dcp.with_suffix(".edf")
+        if best_edif.exists():
+            shutil.copyfile(best_edif, out_edif)
+        else:
+            try:
+                await tester.call_vivado_tool("open_checkpoint", {
+                    "dcp_path": str(output_dcp.resolve())
+                }, timeout=600.0)
+                await tester.call_vivado_tool("write_edif", {
+                    "edif_path": str(out_edif.resolve()),
+                    "force": True,
+                }, timeout=600.0)
+            except Exception as e:
+                logger.warning(f"Best-DCP EDIF write failed: {e}")
+                print(f"[DISPATCH] EDIF regen skipped: {e}")
+
+        print("\n" + "=" * 70)
+        print("DISPATCH SUMMARY")
+        print("=" * 70)
+        for c in candidates:
+            marker = "  *" if c is best else "   "
+            print(f"{marker} {c['strategy']}: success={c['success']} final_wns={c['final_wns']}")
+        print(f"  selected: {best['strategy']} -> {output_dcp}")
+        print(f"  run_dir:  {tester.run_dir}")
+        _emit_summary(best["strategy"], best["final_wns"])
+        return 0
+
+    except KeyboardInterrupt:
+        print("\n[DISPATCH] Interrupted by user")
+        print(f"[DISPATCH] Run directory: {tester.run_dir}")
+        return 130
+    except Exception as e:
+        logger.exception(f"Dispatcher fatal error: {e}")
+        print(f"\n[DISPATCH] Fatal error: {e}")
+        print(f"[DISPATCH] Run directory: {tester.run_dir}")
+        return 1
+    finally:
+        await tester.cleanup()
+
+
 async def main():
     parser = argparse.ArgumentParser(
         description="FPGA Design Optimization Agent",
@@ -3217,7 +3611,32 @@ Examples:
         type=Path,
         help="Directory for logs, journals, and intermediate files. Default: dcp_optimizer_run-<timestamp> in current directory"
     )
-    
+    parser.add_argument(
+        "--llm",
+        action="store_true",
+        help="Run the LLM-guided optimizer (requires OPENROUTER_API_KEY). "
+             "Without this flag the default mode is the deterministic dispatcher "
+             "(analyze design -> pick pblock or fanout phys_opt -> fallback to RuntimeOptimized phys_opt)."
+    )
+    parser.add_argument(
+        "--dispatcher",
+        action="store_true",
+        help="Force dispatcher mode (this is also the default when no other mode flag is given)."
+    )
+    parser.add_argument(
+        "--dispatcher-fanout-directive",
+        default="AggressiveFanoutOpt",
+        help="phys_opt -directive the dispatcher uses for the fanout primary path "
+             "(default: AggressiveFanoutOpt; matrix sweep winner on small / fanout-heavy designs)."
+    )
+    parser.add_argument(
+        "--dispatcher-small-lut-threshold",
+        type=int,
+        default=5000,
+        help="Used-LUT cutoff below which the dispatcher prefers the fanout phys_opt strategy "
+             "over pblock (default: 5000). Designs above the cutoff default to pblock."
+    )
+
     args = parser.parse_args()
     
     # Validate inputs
@@ -3330,12 +3749,42 @@ Examples:
             exit_code = 2
         sys.exit(exit_code)
 
-    # Normal mode - requires API key and LLM
+    # Default mode = deterministic dispatcher. The LLM-guided path is opt-in
+    # via --llm to keep alpha submissions deterministic and free.
+    if args.dispatcher or not args.llm:
+        if args.run_dir is None:
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            run_dir = Path.cwd() / f"dcp_optimizer_run-{timestamp}"
+        else:
+            run_dir = args.run_dir
+
+        print(f"FPGA Design Optimization - DISPATCHER MODE")
+        print(f"========================================================")
+        print(f"Input:       {args.input_dcp.resolve()}")
+        print(f"Output:      {args.output_dcp.resolve()}")
+        print(f"Run dir:     {run_dir}")
+        print(f"Util factor: {args.pblock_util_factor}")
+        print(f"Small-LUT threshold: {args.dispatcher_small_lut_threshold}")
+        print(f"Fanout phys_opt directive: {args.dispatcher_fanout_directive}")
+        print()
+
+        exit_code = await run_dispatcher_mode(
+            args.input_dcp,
+            args.output_dcp,
+            debug=args.debug,
+            run_dir=run_dir,
+            util_factor=args.pblock_util_factor,
+            small_lut_threshold=args.dispatcher_small_lut_threshold,
+            fanout_phys_opt_directive=args.dispatcher_fanout_directive,
+        )
+        sys.exit(exit_code)
+
+    # LLM-guided mode (opt-in via --llm)
     if not args.api_key:
         print("Error: OpenRouter API key required. Set OPENROUTER_API_KEY or use --api-key", file=sys.stderr)
-        print("       Use --test or --baseline to run without LLM", file=sys.stderr)
+        print("       Use the default dispatcher mode (drop --llm) or --baseline / --test to run without LLM", file=sys.stderr)
         sys.exit(1)
-    
+
     if OpenAI is None:
         print("Error: openai package not installed. Run: pip install openai", file=sys.stderr)
         sys.exit(1)
