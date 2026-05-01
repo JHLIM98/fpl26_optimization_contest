@@ -3259,21 +3259,36 @@ async def run_replace_mode(
         await tester.cleanup()
 
 
-def _dispatcher_pick_primary(info: dict, small_lut_threshold: int) -> str:
+def _dispatcher_pick_primary(
+    info: dict,
+    small_lut_threshold: int,
+    dsp_heavy_threshold: int = 20,
+    bram_heavy_threshold: int = 10,
+) -> str:
     """Choose the primary deterministic strategy from analyze() output.
 
     Matrix sweep showed pblock wins on 10/12 benchmarks; the two exceptions
-    (vexriscv ~3K LUT, 3d-rendering ~3K LUT) are small/fanout-heavy designs
-    where AggressiveFanoutOpt-flavored phys_opt outperforms area constraint.
+    (vexriscv ~2K LUT, 3d-rendering ~14K LUT) respond better to
+    AggressiveFanoutOpt-flavored phys_opt than to area constraint. Within the
+    small-LUT band the dispatcher first checks for DSP- or BRAM-heavy designs
+    (e.g. amd_mini-isp: 3181 LUT but 40 DSPs / 12 BRAMs) where pblock wins
+    despite the small LUT count.
     """
-    used_lut = int(info.get("used_lut") or 0)
+    used_lut  = int(info.get("used_lut")  or 0)
+    used_dsp  = int(info.get("used_dsp")  or 0)
+    used_bram = int(info.get("used_bram") or 0)
     fanout_cands = int(info.get("fanout_candidate_count") or 0)
-    if 0 < used_lut < small_lut_threshold:
+
+    dsp_or_bram_heavy = (
+        used_dsp >= dsp_heavy_threshold or used_bram >= bram_heavy_threshold
+    )
+
+    if 0 < used_lut < small_lut_threshold and not dsp_or_bram_heavy:
         return "fanout"
     # Catch fanout-dominated designs that happen to be a bit larger than
     # the small-LUT threshold but still respond best to phys_opt fanout
     # rebalancing (heuristic; pblock will run as the fallback regardless).
-    if fanout_cands >= 5 and used_lut < 2 * small_lut_threshold:
+    if fanout_cands >= 5 and used_lut < 2 * small_lut_threshold and not dsp_or_bram_heavy:
         return "fanout"
     return "pblock"
 
