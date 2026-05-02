@@ -3259,6 +3259,143 @@ async def run_replace_mode(
         await tester.cleanup()
 
 
+_PBLOCK_RANGE_RE = re.compile(
+    r"SLICE_X(\d+)Y(\d+)\s*:\s*SLICE_X(\d+)Y(\d+)",
+    re.IGNORECASE,
+)
+
+
+def _parse_pblock_ranges_from_llm(text: str) -> Optional[str]:
+    """Pull a normalized SLICE_X..Y..:SLICE_X..Y.. (optionally comma-joined)
+    string out of an LLM response. Returns None if no valid range found.
+    Tolerates code fences, prose, multiple regions, and lower/upper case.
+    """
+    if not text:
+        return None
+    matches = _PBLOCK_RANGE_RE.findall(text)
+    if not matches:
+        return None
+    parts = []
+    for x1, y1, x2, y2 in matches:
+        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+        # Normalize so the first corner is lower-left.
+        x_lo, x_hi = sorted((x1, x2))
+        y_lo, y_hi = sorted((y1, y2))
+        if x_lo == x_hi or y_lo == y_hi:
+            # Degenerate (zero-area) region — reject.
+            continue
+        parts.append(f"SLICE_X{x_lo}Y{y_lo}:SLICE_X{x_hi}Y{y_hi}")
+    if not parts:
+        return None
+    return ", ".join(parts)
+
+
+_PBLOCK_LLM_SYSTEM_PROMPT = """\
+You are an FPGA backend placement specialist. Your only job is to propose a
+single pblock ranges string that can be passed to Vivado's
+create_pblock + add_cells_to_pblock + resize_pblock flow to constrain a
+design to a smaller region for better timing.
+
+OUTPUT REQUIREMENTS — VERY IMPORTANT:
+- Reply with ONLY a pblock ranges string. No prose, no markdown.
+- Format: SLICE_X<col_min>Y<row_min>:SLICE_X<col_max>Y<row_max>
+- Multiple regions allowed, comma-separated. Use only SLICE columns
+  (no DSP48/RAMB columns — Vivado will auto-include those inside the
+  bounding box).
+
+PLACEMENT PRINCIPLES:
+- Smaller pblock => more compact placement => shorter wire delay => better Fmax.
+- Too small => routing failure or timing regression. Aim for ~1.3-1.8x of
+  the area implied by current LUT/FF utilization.
+- Aspect ratio matters. Tall narrow regions help register-heavy designs;
+  wider regions help DSP-cascading designs.
+
+KNOWN GOOD PRECEDENT (logicnets_jscl_2025.1, ~60K LUT, ~30K FF):
+- RapidWright auto-derived ranges via center-of-mass yielded only +20 MHz.
+- A hand-tuned region 'SLICE_X55Y60:SLICE_X111Y254' (~57 cols x 195 rows,
+  shifted away from the corner the auto heuristic picked) yielded +110 MHz.
+- This shows the auto heuristic often picks a region that is the right SIZE
+  but the wrong POSITION/SHAPE. Adjust position/aspect ratio first.
+
+Respond with the ranges string only.
+"""
+
+
+def _llm_propose_pblock_ranges(
+    api_key: str,
+    model: str,
+    context: dict,
+    timeout: float = 60.0,
+    max_output_tokens: int = 200,
+) -> Optional[str]:
+    """One-shot OpenRouter call to propose alternative pblock_ranges.
+
+    Returns a normalized ranges string (caller-validated by the regex parser),
+    or None on any failure. The caller MUST be prepared to fall back to the
+    auto-derived ranges. Cost cap is enforced by max_output_tokens + a tight
+    user prompt; on default Grok this works out to ~$0.001 per call.
+    """
+    if OpenAI is None:
+        logger.warning("openai package missing; cannot propose pblock_ranges via LLM")
+        return None
+    if not api_key:
+        return None
+
+    try:
+        client = OpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1")
+    except Exception as e:
+        logger.warning(f"OpenAI client init failed: {e}")
+        return None
+
+    user_prompt = (
+        "Design characteristics:\n"
+        f"  Used LUT:  {context.get('used_lut')}\n"
+        f"  Used FF:   {context.get('used_ff')}\n"
+        f"  Used DSP:  {context.get('used_dsp')}\n"
+        f"  Used BRAM: {context.get('used_bram')}\n"
+        f"  Critical-path spread (max/avg cell-tile distance): "
+        f"{context.get('max_spread_distance')}/{context.get('avg_spread_distance')}\n"
+        f"  Initial WNS:    {context.get('initial_wns')} ns\n"
+        f"  Clock period:   {context.get('clock_period')} ns "
+        f"(target Fmax {context.get('target_fmax')} MHz)\n"
+        "\nAuto-derived attempt (RapidWright analyze_fabric_for_pblock):\n"
+        f"  Ranges:          {context.get('auto_ranges')}\n"
+        f"  Result Fmax:     {context.get('auto_final_fmax')} MHz\n"
+        f"  Improvement:     {context.get('auto_delta_fmax')} MHz\n"
+        f"  Routing errors:  {context.get('auto_routing_errors')}\n"
+        "\nThe auto attempt was weak. Propose alternative pblock_ranges that "
+        "may give better Fmax. Reply with the ranges string only."
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": _PBLOCK_LLM_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=max_output_tokens,
+            timeout=timeout,
+            temperature=0.2,
+        )
+    except Exception as e:
+        logger.warning(f"LLM pblock proposal call failed: {e}")
+        return None
+
+    raw = ""
+    try:
+        raw = resp.choices[0].message.content or ""
+    except Exception as e:
+        logger.warning(f"LLM response parse failed: {e}")
+        return None
+
+    parsed = _parse_pblock_ranges_from_llm(raw)
+    logger.info(
+        f"LLM pblock proposal: raw={raw!r}\n  parsed={parsed!r}"
+    )
+    return parsed
+
+
 def _dispatcher_pick_primary(
     info: dict,
     small_lut_threshold: int,
@@ -3370,13 +3507,28 @@ async def run_dispatcher_mode(
     util_factor: float = 1.5,
     small_lut_threshold: int = 5000,
     fanout_phys_opt_directive: str = "AggressiveFanoutOpt",
+    llm_api_key: Optional[str] = None,
+    llm_model: str = DEFAULT_MODEL,
+    llm_budget: int = 0,
+    llm_weak_threshold_mhz: float = 25.0,
+    llm_time_cap_seconds: int = 1800,
+    llm_primary_runtime_cap_seconds: int = 1080,
 ):
     """Deterministic dispatcher: analyze the design, pick a primary strategy,
     fall back to RuntimeOptimized phys_opt if the primary regresses, and
     always emit a final DCP (+ .edf for the validator).
+
+    Optional LLM augment: when ``llm_budget > 0`` and ``llm_api_key`` is set,
+    a single targeted LLM call is made to propose alternative pblock_ranges
+    *only* if the auto-derived pblock attempt was weak (delta_fmax under
+    ``llm_weak_threshold_mhz``, or routing errors, or regression). Time
+    budget guards prevent the retry from pushing the run past the contest's
+    1-hour wall-clock cap.
     """
     tester = FPGAOptimizerTest(debug=debug, run_dir=run_dir)
     overall_start = time.time()
+    llm_calls_used = 0
+    llm_calls_budget = max(0, int(llm_budget)) if llm_api_key else 0
 
     def _emit_summary(selected_label: str, final_wns: Optional[float]) -> None:
         elapsed = time.time() - overall_start
@@ -3386,7 +3538,10 @@ async def run_dispatcher_mode(
             initial_wns=tester.initial_wns,
             final_wns=final_wns,
             clock_period=tester.clock_period,
-            extra_info=f"Strategy: {selected_label}"
+            extra_info=(
+                f"Strategy: {selected_label}\n"
+                f"LLM calls: {llm_calls_used}/{llm_calls_budget}"
+            ),
         )
 
     try:
@@ -3422,28 +3577,168 @@ async def run_dispatcher_mode(
         candidates: list[dict] = []
 
         # ---- Run primary strategy ----
-        primary_dcp = Path(tester.temp_dir) / "dispatcher_primary.dcp"
-        print("\n" + "-" * 60)
-        print(f"DISPATCH STEP A: primary strategy = {primary}")
-        print("-" * 60)
-        primary_result = await _dispatcher_run_strategy(
-            tester, primary, input_dcp, primary_dcp,
-            util_factor=util_factor,
-            phys_opt_directive=fanout_phys_opt_directive,
-        )
-        primary_result["dcp"] = primary_dcp if primary_result.get("success") else None
-        candidates.append(primary_result)
-        for note in primary_result["notes"]:
-            print(f"[DISPATCH] {primary_result['strategy']}: {note}")
-        print(
-            f"[DISPATCH] {primary_result['strategy']}: "
-            f"success={primary_result['success']} final_wns={primary_result['final_wns']}"
-        )
+        # Special-case pblock so we keep the underlying try_pblock stats
+        # (auto-derived ranges, routing_errors). This lets the LLM retry hook
+        # decide whether to attempt a single proposal call.
+        primary_step_start = time.time()
+        if primary == "pblock":
+            print("\n" + "-" * 60)
+            print("DISPATCH STEP A: primary strategy = pblock (auto-derived ranges)")
+            print("-" * 60)
+            primary_dcp = Path(tester.temp_dir) / "dispatcher_primary_pblock_auto.dcp"
+            auto_stats = await tester.try_pblock(
+                input_dcp, primary_dcp, util_factor=util_factor
+            )
+            for note in auto_stats.get("notes") or []:
+                print(f"[DISPATCH] pblock(auto): {note}")
+            primary_result = {
+                "strategy": "pblock(auto)",
+                "success": bool(auto_stats.get("success")) and primary_dcp.exists(),
+                "final_wns": auto_stats.get("final_wns"),
+                "notes": list(auto_stats.get("notes") or []),
+                "dcp": primary_dcp if (auto_stats.get("success") and primary_dcp.exists()) else None,
+                "ranges": auto_stats.get("pblock_ranges"),
+                "routing_errors": auto_stats.get("routing_errors"),
+            }
+            candidates.append(primary_result)
+            print(
+                f"[DISPATCH] pblock(auto): success={primary_result['success']} "
+                f"final_wns={primary_result['final_wns']} "
+                f"routing_errors={primary_result['routing_errors']}"
+            )
+        else:
+            print("\n" + "-" * 60)
+            print(f"DISPATCH STEP A: primary strategy = {primary}")
+            print("-" * 60)
+            primary_dcp = Path(tester.temp_dir) / "dispatcher_primary.dcp"
+            primary_result = await _dispatcher_run_strategy(
+                tester, primary, input_dcp, primary_dcp,
+                util_factor=util_factor,
+                phys_opt_directive=fanout_phys_opt_directive,
+            )
+            primary_result["dcp"] = primary_dcp if primary_result.get("success") else None
+            candidates.append(primary_result)
+            for note in primary_result["notes"]:
+                print(f"[DISPATCH] {primary_result['strategy']}: {note}")
+            print(
+                f"[DISPATCH] {primary_result['strategy']}: "
+                f"success={primary_result['success']} final_wns={primary_result['final_wns']}"
+            )
 
+        primary_runtime = time.time() - primary_step_start
+
+        # ---- Optional LLM-proposed pblock retry ----
+        # Single targeted call: only when the auto-pblock attempt was weak and
+        # we still have time + budget. Each successful improvement overwrites
+        # `output_dcp`-bound selection later via the candidate list.
+        if (
+            primary == "pblock"
+            and llm_calls_budget > llm_calls_used
+            and primary_result.get("success") is not False  # auto attempt at least returned
+        ):
+            auto_final_wns = primary_result.get("final_wns")
+            clock_period = info.get("clock_period")
+            initial_fmax = tester.calculate_fmax(initial_wns, clock_period)
+            auto_final_fmax = tester.calculate_fmax(auto_final_wns, clock_period) if auto_final_wns is not None else None
+            auto_delta_fmax = (
+                auto_final_fmax - initial_fmax
+                if (auto_final_fmax is not None and initial_fmax is not None)
+                else None
+            )
+            auto_routing_errors = primary_result.get("routing_errors") or 0
+            auto_regressed = (
+                auto_final_wns is None
+                or initial_wns is None
+                or auto_final_wns <= initial_wns
+            )
+
+            weak = (
+                auto_regressed
+                or auto_routing_errors > 0
+                or (auto_delta_fmax is not None and auto_delta_fmax < llm_weak_threshold_mhz)
+            )
+
+            elapsed_so_far = time.time() - overall_start
+            time_ok = (
+                elapsed_so_far < llm_time_cap_seconds
+                and primary_runtime < llm_primary_runtime_cap_seconds
+            )
+
+            if weak and time_ok:
+                print("\n" + "-" * 60)
+                print(
+                    f"DISPATCH STEP A.1: LLM-proposed pblock retry "
+                    f"(weak auto delta={auto_delta_fmax} MHz, "
+                    f"routing_errors={auto_routing_errors}, elapsed={elapsed_so_far:.0f}s)"
+                )
+                print("-" * 60)
+                target_fmax = (1000.0 / clock_period) if clock_period else None
+                proposed = _llm_propose_pblock_ranges(
+                    api_key=llm_api_key,
+                    model=llm_model,
+                    context={
+                        "used_lut":  info.get("used_lut"),
+                        "used_ff":   info.get("used_ff"),
+                        "used_dsp":  info.get("used_dsp"),
+                        "used_bram": info.get("used_bram"),
+                        "max_spread_distance": info.get("max_spread_distance"),
+                        "avg_spread_distance": info.get("avg_spread_distance"),
+                        "initial_wns":  initial_wns,
+                        "clock_period": clock_period,
+                        "target_fmax":  f"{target_fmax:.2f}" if target_fmax else None,
+                        "auto_ranges":  primary_result.get("ranges"),
+                        "auto_final_fmax": (f"{auto_final_fmax:.2f}" if auto_final_fmax else None),
+                        "auto_delta_fmax": (f"{auto_delta_fmax:+.2f}" if auto_delta_fmax is not None else None),
+                        "auto_routing_errors": auto_routing_errors,
+                    },
+                )
+                llm_calls_used += 1
+                if proposed and proposed != primary_result.get("ranges"):
+                    print(f"[DISPATCH] LLM proposed pblock_ranges: {proposed}")
+                    llm_dcp = Path(tester.temp_dir) / "dispatcher_primary_pblock_llm.dcp"
+                    llm_stats = await tester.try_pblock(
+                        input_dcp, llm_dcp,
+                        pblock_ranges=proposed,
+                        util_factor=util_factor,
+                    )
+                    for note in llm_stats.get("notes") or []:
+                        print(f"[DISPATCH] pblock(llm): {note}")
+                    llm_result = {
+                        "strategy": "pblock(llm)",
+                        "success": bool(llm_stats.get("success")) and llm_dcp.exists(),
+                        "final_wns": llm_stats.get("final_wns"),
+                        "notes": list(llm_stats.get("notes") or []),
+                        "dcp": llm_dcp if (llm_stats.get("success") and llm_dcp.exists()) else None,
+                        "ranges": llm_stats.get("pblock_ranges"),
+                        "routing_errors": llm_stats.get("routing_errors"),
+                    }
+                    candidates.append(llm_result)
+                    print(
+                        f"[DISPATCH] pblock(llm): success={llm_result['success']} "
+                        f"final_wns={llm_result['final_wns']} "
+                        f"routing_errors={llm_result['routing_errors']}"
+                    )
+                elif proposed:
+                    print("[DISPATCH] LLM proposed identical ranges; skipping retry")
+                else:
+                    print("[DISPATCH] LLM did not return parseable pblock_ranges; skipping retry")
+            elif weak and not time_ok:
+                print(
+                    f"[DISPATCH] Skipping LLM retry: time budget tight "
+                    f"(elapsed={elapsed_so_far:.0f}s, primary={primary_runtime:.0f}s)"
+                )
+
+        # `primary_improved` is now defined as the best-so-far across all
+        # primary candidates (auto + optional LLM retry). Falls back to
+        # bl_runtime only if everything we've tried still regresses.
+        best_so_far = None
+        for c in candidates:
+            if c.get("success") and c.get("final_wns") is not None:
+                if best_so_far is None or c["final_wns"] > best_so_far["final_wns"]:
+                    best_so_far = c
         primary_improved = (
-            primary_result.get("success")
-            and primary_result.get("final_wns") is not None
-            and primary_result["final_wns"] > initial_wns
+            best_so_far is not None
+            and best_so_far["final_wns"] > initial_wns
         )
 
         # ---- Fallback: bl_runtime ----
@@ -3651,6 +3946,23 @@ Examples:
         help="Used-LUT cutoff below which the dispatcher prefers the fanout phys_opt strategy "
              "over pblock (default: 5000). Designs above the cutoff default to pblock."
     )
+    parser.add_argument(
+        "--llm-budget",
+        type=int,
+        default=None,
+        help="Max LLM calls per dispatcher run for the pblock-ranges retry hook. "
+             "Default: 1 if OPENROUTER_API_KEY is set, else 0. Set to 0 to disable LLM "
+             "augment even when an API key is available."
+    )
+    parser.add_argument(
+        "--llm-weak-threshold-mhz",
+        type=float,
+        default=25.0,
+        help="When pblock(auto) yields delta_fmax below this threshold (MHz), the "
+             "dispatcher spends its single LLM call to propose alternative ranges. "
+             "Default: 25.0. Lowering it makes the LLM trigger more cautious; "
+             "raising it makes the LLM trigger more aggressive."
+    )
 
     args = parser.parse_args()
     
@@ -3773,6 +4085,16 @@ Examples:
         else:
             run_dir = args.run_dir
 
+        # LLM augment auto-enables when OPENROUTER_API_KEY is set (alpha
+        # submission environment will set this). Defaults to 1 call/run; set
+        # --llm-budget 0 to opt out, or pass --llm-budget N to allow more.
+        llm_budget_effective = (
+            args.llm_budget
+            if args.llm_budget is not None
+            else (1 if args.api_key else 0)
+        )
+        llm_api_key_effective = args.api_key if llm_budget_effective > 0 else None
+
         print(f"FPGA Design Optimization - DISPATCHER MODE")
         print(f"========================================================")
         print(f"Input:       {args.input_dcp.resolve()}")
@@ -3781,6 +4103,16 @@ Examples:
         print(f"Util factor: {args.pblock_util_factor}")
         print(f"Small-LUT threshold: {args.dispatcher_small_lut_threshold}")
         print(f"Fanout phys_opt directive: {args.dispatcher_fanout_directive}")
+        if llm_budget_effective > 0:
+            print(
+                f"LLM augment: ENABLED (budget={llm_budget_effective}, "
+                f"weak<{args.llm_weak_threshold_mhz} MHz, model={args.model})"
+            )
+        else:
+            print(
+                "LLM augment: disabled "
+                "(set OPENROUTER_API_KEY or --api-key to enable, --llm-budget 0 to force off)"
+            )
         print()
 
         exit_code = await run_dispatcher_mode(
@@ -3791,6 +4123,10 @@ Examples:
             util_factor=args.pblock_util_factor,
             small_lut_threshold=args.dispatcher_small_lut_threshold,
             fanout_phys_opt_directive=args.dispatcher_fanout_directive,
+            llm_api_key=llm_api_key_effective,
+            llm_model=args.model,
+            llm_budget=llm_budget_effective,
+            llm_weak_threshold_mhz=args.llm_weak_threshold_mhz,
         )
         sys.exit(exit_code)
 

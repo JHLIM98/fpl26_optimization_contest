@@ -95,7 +95,10 @@ help:
 	@echo "  STRATEGY        - Strategy name for run_strategy target (e.g. 'replace')"
 	@echo "  OUTPUT          - Optional output DCP path"
 	@echo "  RUN_DIR         - Optional run directory for logs and intermediate files"
-	@echo "  LLM             - Set LLM=1 with run_optimizer to opt into LLM-guided mode"
+	@echo "  LLM             - Set LLM=1 with run_optimizer to opt into full LLM-guided mode"
+	@echo "  LLM_BUDGET      - Max LLM calls per dispatcher run (default 1 if OPENROUTER_API_KEY set, else 0)"
+	@echo "  LLM_WEAK_MHZ    - Auto-pblock delta_fmax (MHz) below which the LLM retry triggers (default 25)"
+	@echo "  OPENROUTER_API_KEY - Env var; if set, dispatcher auto-enables a single LLM pblock-ranges retry"
 	@echo "  MAX_NETS        - Max high fanout nets to optimize in non-LLM modes (default: 5)"
 	@echo "  GOLDEN          - Golden (reference) DCP for validation"
 	@echo "  REVISED         - Revised (optimized) DCP for validation"
@@ -248,7 +251,7 @@ run_optimizer:
 		fi; \
 	fi; \
 	echo ""; \
-	$(PYTHON) dcp_optimizer.py "$(DCP)" $(if $(OUTPUT),--output "$(OUTPUT)") $(if $(RUN_DIR),--run-dir "$(RUN_DIR)") $(if $(LLM),--llm)
+	$(PYTHON) dcp_optimizer.py "$(DCP)" $(if $(OUTPUT),--output "$(OUTPUT)") $(if $(RUN_DIR),--run-dir "$(RUN_DIR)") $(if $(LLM),--llm) $(if $(LLM_BUDGET),--llm-budget $(LLM_BUDGET)) $(if $(LLM_WEAK_MHZ),--llm-weak-threshold-mhz $(LLM_WEAK_MHZ))
 
 # Run test mode: Run dcp_optimizer.py with --test flag (no LLM required)
 run_test:
