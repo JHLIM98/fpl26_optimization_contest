@@ -3513,6 +3513,7 @@ async def run_dispatcher_mode(
     llm_weak_threshold_mhz: float = 25.0,
     llm_time_cap_seconds: int = 1800,
     llm_primary_runtime_cap_seconds: int = 1080,
+    llm_mock_ranges: Optional[str] = None,
 ):
     """Deterministic dispatcher: analyze the design, pick a primary strategy,
     fall back to RuntimeOptimized phys_opt if the primary regresses, and
@@ -3528,7 +3529,12 @@ async def run_dispatcher_mode(
     tester = FPGAOptimizerTest(debug=debug, run_dir=run_dir)
     overall_start = time.time()
     llm_calls_used = 0
-    llm_calls_budget = max(0, int(llm_budget)) if llm_api_key else 0
+    # Mock mode bypasses the real API but still consumes budget so the same
+    # weak-result trigger logic is exercised end-to-end.
+    llm_calls_budget = (
+        max(1, int(llm_budget) or 1) if llm_mock_ranges
+        else (max(0, int(llm_budget)) if llm_api_key else 0)
+    )
 
     def _emit_summary(selected_label: str, final_wns: Optional[float]) -> None:
         elapsed = time.time() - overall_start
@@ -3628,14 +3634,12 @@ async def run_dispatcher_mode(
         primary_runtime = time.time() - primary_step_start
 
         # ---- Optional LLM-proposed pblock retry ----
-        # Single targeted call: only when the auto-pblock attempt was weak and
-        # we still have time + budget. Each successful improvement overwrites
-        # `output_dcp`-bound selection later via the candidate list.
-        if (
-            primary == "pblock"
-            and llm_calls_budget > llm_calls_used
-            and primary_result.get("success") is not False  # auto attempt at least returned
-        ):
+        # Single targeted call when the auto-pblock attempt was weak (or
+        # outright failed) and we still have time + budget. Note: when ranges
+        # are supplied directly, try_pblock skips RW analyze and goes straight
+        # to Vivado place+route, so this path can also rescue failures of the
+        # RW auto-derive step itself.
+        if primary == "pblock" and llm_calls_budget > llm_calls_used:
             auto_final_wns = primary_result.get("final_wns")
             clock_period = info.get("clock_period")
             initial_fmax = tester.calculate_fmax(initial_wns, clock_period)
@@ -3646,6 +3650,7 @@ async def run_dispatcher_mode(
                 else None
             )
             auto_routing_errors = primary_result.get("routing_errors") or 0
+            auto_failed = not primary_result.get("success")
             auto_regressed = (
                 auto_final_wns is None
                 or initial_wns is None
@@ -3653,7 +3658,8 @@ async def run_dispatcher_mode(
             )
 
             weak = (
-                auto_regressed
+                auto_failed
+                or auto_regressed
                 or auto_routing_errors > 0
                 or (auto_delta_fmax is not None and auto_delta_fmax < llm_weak_threshold_mhz)
             )
@@ -3673,25 +3679,31 @@ async def run_dispatcher_mode(
                 )
                 print("-" * 60)
                 target_fmax = (1000.0 / clock_period) if clock_period else None
-                proposed = _llm_propose_pblock_ranges(
-                    api_key=llm_api_key,
-                    model=llm_model,
-                    context={
-                        "used_lut":  info.get("used_lut"),
-                        "used_ff":   info.get("used_ff"),
-                        "used_dsp":  info.get("used_dsp"),
-                        "used_bram": info.get("used_bram"),
-                        "max_spread_distance": info.get("max_spread_distance"),
-                        "avg_spread_distance": info.get("avg_spread_distance"),
-                        "initial_wns":  initial_wns,
-                        "clock_period": clock_period,
-                        "target_fmax":  f"{target_fmax:.2f}" if target_fmax else None,
-                        "auto_ranges":  primary_result.get("ranges"),
-                        "auto_final_fmax": (f"{auto_final_fmax:.2f}" if auto_final_fmax else None),
-                        "auto_delta_fmax": (f"{auto_delta_fmax:+.2f}" if auto_delta_fmax is not None else None),
-                        "auto_routing_errors": auto_routing_errors,
-                    },
-                )
+                if llm_mock_ranges is not None:
+                    # Test path: pretend the LLM returned `llm_mock_ranges`.
+                    # Still goes through the parser to confirm validity.
+                    print(f"[DISPATCH] LLM mock active; using ranges {llm_mock_ranges!r}")
+                    proposed = _parse_pblock_ranges_from_llm(llm_mock_ranges)
+                else:
+                    proposed = _llm_propose_pblock_ranges(
+                        api_key=llm_api_key,
+                        model=llm_model,
+                        context={
+                            "used_lut":  info.get("used_lut"),
+                            "used_ff":   info.get("used_ff"),
+                            "used_dsp":  info.get("used_dsp"),
+                            "used_bram": info.get("used_bram"),
+                            "max_spread_distance": info.get("max_spread_distance"),
+                            "avg_spread_distance": info.get("avg_spread_distance"),
+                            "initial_wns":  initial_wns,
+                            "clock_period": clock_period,
+                            "target_fmax":  f"{target_fmax:.2f}" if target_fmax else None,
+                            "auto_ranges":  primary_result.get("ranges"),
+                            "auto_final_fmax": (f"{auto_final_fmax:.2f}" if auto_final_fmax else None),
+                            "auto_delta_fmax": (f"{auto_delta_fmax:+.2f}" if auto_delta_fmax is not None else None),
+                            "auto_routing_errors": auto_routing_errors,
+                        },
+                    )
                 llm_calls_used += 1
                 if proposed and proposed != primary_result.get("ranges"):
                     print(f"[DISPATCH] LLM proposed pblock_ranges: {proposed}")
@@ -3963,6 +3975,13 @@ Examples:
              "Default: 25.0. Lowering it makes the LLM trigger more cautious; "
              "raising it makes the LLM trigger more aggressive."
     )
+    parser.add_argument(
+        "--llm-mock-ranges",
+        default=None,
+        help="Test-only: skip the real OpenRouter call and treat this string as the "
+             "LLM-proposed pblock_ranges. Used to verify the retry-pblock integration "
+             "path end-to-end without burning API credit."
+    )
 
     args = parser.parse_args()
     
@@ -4088,12 +4107,17 @@ Examples:
         # LLM augment auto-enables when OPENROUTER_API_KEY is set (alpha
         # submission environment will set this). Defaults to 1 call/run; set
         # --llm-budget 0 to opt out, or pass --llm-budget N to allow more.
-        llm_budget_effective = (
-            args.llm_budget
-            if args.llm_budget is not None
-            else (1 if args.api_key else 0)
-        )
-        llm_api_key_effective = args.api_key if llm_budget_effective > 0 else None
+        # --llm-mock-ranges short-circuits the real API call (test-only).
+        if args.llm_mock_ranges is not None:
+            llm_budget_effective = max(args.llm_budget or 1, 1)
+            llm_api_key_effective = None
+        else:
+            llm_budget_effective = (
+                args.llm_budget
+                if args.llm_budget is not None
+                else (1 if args.api_key else 0)
+            )
+            llm_api_key_effective = args.api_key if llm_budget_effective > 0 else None
 
         print(f"FPGA Design Optimization - DISPATCHER MODE")
         print(f"========================================================")
@@ -4127,6 +4151,7 @@ Examples:
             llm_model=args.model,
             llm_budget=llm_budget_effective,
             llm_weak_threshold_mhz=args.llm_weak_threshold_mhz,
+            llm_mock_ranges=args.llm_mock_ranges,
         )
         sys.exit(exit_code)
 

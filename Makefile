@@ -251,7 +251,7 @@ run_optimizer:
 		fi; \
 	fi; \
 	echo ""; \
-	$(PYTHON) dcp_optimizer.py "$(DCP)" $(if $(OUTPUT),--output "$(OUTPUT)") $(if $(RUN_DIR),--run-dir "$(RUN_DIR)") $(if $(LLM),--llm) $(if $(LLM_BUDGET),--llm-budget $(LLM_BUDGET)) $(if $(LLM_WEAK_MHZ),--llm-weak-threshold-mhz $(LLM_WEAK_MHZ))
+	$(PYTHON) dcp_optimizer.py "$(DCP)" $(if $(OUTPUT),--output "$(OUTPUT)") $(if $(RUN_DIR),--run-dir "$(RUN_DIR)") $(if $(LLM),--llm) $(if $(LLM_BUDGET),--llm-budget $(LLM_BUDGET)) $(if $(LLM_WEAK_MHZ),--llm-weak-threshold-mhz $(LLM_WEAK_MHZ)) $(if $(LLM_MOCK_RANGES),--llm-mock-ranges "$(LLM_MOCK_RANGES)")
 
 # Run test mode: Run dcp_optimizer.py with --test flag (no LLM required)
 run_test:
