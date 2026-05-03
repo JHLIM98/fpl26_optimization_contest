@@ -4,169 +4,39 @@
 # SPDX-License-Identifier: Apache 2.0
 
 """
-Heuristic strategy dispatcher with optional single-call LLM augment.
+Heuristic strategy dispatcher (alpha-submission default path).
 
-The dispatcher analyzes design characteristics (utilization, spread,
-high-fanout candidate count), picks a primary strategy
-(``fanout`` or ``pblock``), runs it through :mod:`optimizer.strategies`,
-and falls back to ``RuntimeOptimized`` phys_opt if the primary regresses.
+This module decides *which* strategy to run based on static analysis of
+the input DCP, then runs it through :mod:`optimizer.strategies` and
+keeps the best result. The flow is:
 
-When an OpenRouter API key is present (alpha submission environment sets
-``OPENROUTER_API_KEY`` automatically), a single targeted LLM call may be
-spent to propose alternative pblock_ranges if the auto-derived attempt
-came back weak. Cost stays well under the $1/benchmark cap.
+  1. ``analyze_design_characteristics`` — sample utilization, spread,
+     fanout candidates.
+  2. ``_dispatcher_pick_primary`` — heuristic chooses ``fanout`` or
+     ``pblock``.
+  3. Run primary; for ``pblock`` keep auto-derived ranges and stats so
+     the optional LLM augment can decide whether to retry.
+  4. Optional LLM retry (delegated to :mod:`optimizer.llm_augment`) if
+     the auto pblock attempt looks weak — single OpenRouter call.
+  5. Best-of {auto, llm} selection. If everything regresses vs initial,
+     fall back to ``RuntimeOptimized`` phys_opt.
+  6. Always emit a final DCP plus ``.edf`` for the validator.
+
+LLM-related code lives entirely in :mod:`optimizer.llm_augment`; this
+module only invokes its public helpers.
 """
 
 import logging
-import re
 import shutil
 import time
 from pathlib import Path
 from typing import Optional
 
-from openai import OpenAI
-
 from .base import DEFAULT_MODEL
+from .llm_augment import parse_pblock_ranges_from_llm, propose_pblock_ranges
 from .strategies import FPGAOptimizerTest
 
 logger = logging.getLogger(__name__)
-
-
-_PBLOCK_RANGE_RE = re.compile(
-    r"SLICE_X(\d+)Y(\d+)\s*:\s*SLICE_X(\d+)Y(\d+)",
-    re.IGNORECASE,
-)
-
-
-def _parse_pblock_ranges_from_llm(text: str) -> Optional[str]:
-    """Pull a normalized SLICE_X..Y..:SLICE_X..Y.. (optionally comma-joined)
-    string out of an LLM response. Returns None if no valid range found.
-    Tolerates code fences, prose, multiple regions, and lower/upper case.
-    """
-    if not text:
-        return None
-    matches = _PBLOCK_RANGE_RE.findall(text)
-    if not matches:
-        return None
-    parts = []
-    for x1, y1, x2, y2 in matches:
-        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-        # Normalize so the first corner is lower-left.
-        x_lo, x_hi = sorted((x1, x2))
-        y_lo, y_hi = sorted((y1, y2))
-        if x_lo == x_hi or y_lo == y_hi:
-            # Degenerate (zero-area) region — reject.
-            continue
-        parts.append(f"SLICE_X{x_lo}Y{y_lo}:SLICE_X{x_hi}Y{y_hi}")
-    if not parts:
-        return None
-    return ", ".join(parts)
-
-
-_PBLOCK_LLM_SYSTEM_PROMPT = """\
-You are an FPGA backend placement specialist. Your only job is to propose a
-single pblock ranges string that can be passed to Vivado's
-create_pblock + add_cells_to_pblock + resize_pblock flow to constrain a
-design to a smaller region for better timing.
-
-OUTPUT REQUIREMENTS — VERY IMPORTANT:
-- Reply with ONLY a pblock ranges string. No prose, no markdown.
-- Format: SLICE_X<col_min>Y<row_min>:SLICE_X<col_max>Y<row_max>
-- Multiple regions allowed, comma-separated. Use only SLICE columns
-  (no DSP48/RAMB columns — Vivado will auto-include those inside the
-  bounding box).
-
-PLACEMENT PRINCIPLES:
-- Smaller pblock => more compact placement => shorter wire delay => better Fmax.
-- Too small => routing failure or timing regression. Aim for ~1.3-1.8x of
-  the area implied by current LUT/FF utilization.
-- Aspect ratio matters. Tall narrow regions help register-heavy designs;
-  wider regions help DSP-cascading designs.
-
-KNOWN GOOD PRECEDENT (logicnets_jscl_2025.1, ~60K LUT, ~30K FF):
-- RapidWright auto-derived ranges via center-of-mass yielded only +20 MHz.
-- A hand-tuned region 'SLICE_X55Y60:SLICE_X111Y254' (~57 cols x 195 rows,
-  shifted away from the corner the auto heuristic picked) yielded +110 MHz.
-- This shows the auto heuristic often picks a region that is the right SIZE
-  but the wrong POSITION/SHAPE. Adjust position/aspect ratio first.
-
-Respond with the ranges string only.
-"""
-
-
-def _llm_propose_pblock_ranges(
-    api_key: str,
-    model: str,
-    context: dict,
-    timeout: float = 60.0,
-    max_output_tokens: int = 200,
-) -> Optional[str]:
-    """One-shot OpenRouter call to propose alternative pblock_ranges.
-
-    Returns a normalized ranges string (caller-validated by the regex parser),
-    or None on any failure. The caller MUST be prepared to fall back to the
-    auto-derived ranges. Cost cap is enforced by max_output_tokens + a tight
-    user prompt; on default Grok this works out to ~$0.001 per call.
-    """
-    if OpenAI is None:
-        logger.warning("openai package missing; cannot propose pblock_ranges via LLM")
-        return None
-    if not api_key:
-        return None
-
-    try:
-        client = OpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1")
-    except Exception as e:
-        logger.warning(f"OpenAI client init failed: {e}")
-        return None
-
-    user_prompt = (
-        "Design characteristics:\n"
-        f"  Used LUT:  {context.get('used_lut')}\n"
-        f"  Used FF:   {context.get('used_ff')}\n"
-        f"  Used DSP:  {context.get('used_dsp')}\n"
-        f"  Used BRAM: {context.get('used_bram')}\n"
-        f"  Critical-path spread (max/avg cell-tile distance): "
-        f"{context.get('max_spread_distance')}/{context.get('avg_spread_distance')}\n"
-        f"  Initial WNS:    {context.get('initial_wns')} ns\n"
-        f"  Clock period:   {context.get('clock_period')} ns "
-        f"(target Fmax {context.get('target_fmax')} MHz)\n"
-        "\nAuto-derived attempt (RapidWright analyze_fabric_for_pblock):\n"
-        f"  Ranges:          {context.get('auto_ranges')}\n"
-        f"  Result Fmax:     {context.get('auto_final_fmax')} MHz\n"
-        f"  Improvement:     {context.get('auto_delta_fmax')} MHz\n"
-        f"  Routing errors:  {context.get('auto_routing_errors')}\n"
-        "\nThe auto attempt was weak. Propose alternative pblock_ranges that "
-        "may give better Fmax. Reply with the ranges string only."
-    )
-
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": _PBLOCK_LLM_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_tokens=max_output_tokens,
-            timeout=timeout,
-            temperature=0.2,
-        )
-    except Exception as e:
-        logger.warning(f"LLM pblock proposal call failed: {e}")
-        return None
-
-    raw = ""
-    try:
-        raw = resp.choices[0].message.content or ""
-    except Exception as e:
-        logger.warning(f"LLM response parse failed: {e}")
-        return None
-
-    parsed = _parse_pblock_ranges_from_llm(raw)
-    logger.info(
-        f"LLM pblock proposal: raw={raw!r}\n  parsed={parsed!r}"
-    )
-    return parsed
 
 
 def _dispatcher_pick_primary(
@@ -456,9 +326,9 @@ async def run_dispatcher_mode(
                     # Test path: pretend the LLM returned `llm_mock_ranges`.
                     # Still goes through the parser to confirm validity.
                     print(f"[DISPATCH] LLM mock active; using ranges {llm_mock_ranges!r}")
-                    proposed = _parse_pblock_ranges_from_llm(llm_mock_ranges)
+                    proposed = parse_pblock_ranges_from_llm(llm_mock_ranges)
                 else:
-                    proposed = _llm_propose_pblock_ranges(
+                    proposed = propose_pblock_ranges(
                         api_key=llm_api_key,
                         model=llm_model,
                         context={

@@ -27,7 +27,7 @@ from openai import OpenAI
 
 from .base import DEFAULT_MODEL
 from .dispatcher import run_dispatcher_mode
-from .llm_optimizer import DCPOptimizer
+from reference.contest_llm_optimizer import DCPOptimizer
 from .strategies import FPGAOptimizerTest
 
 logger = logging.getLogger(__name__)

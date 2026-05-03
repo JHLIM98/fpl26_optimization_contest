@@ -4,13 +4,15 @@
 # SPDX-License-Identifier: Apache 2.0
 
 """
-LLM-guided full optimizer (contest original).
+Contest-original LLM-guided full optimizer (reference material).
 
-This module hosts the agentic optimizer that drives RapidWright/Vivado MCP
-tools through an LLM tool-calling loop. It is **only** invoked when the
-user explicitly passes ``--llm`` to ``dcp_optimizer.py``; the alpha
-submission default is the deterministic dispatcher in
-:mod:`optimizer.dispatcher`.
+This is the agentic optimizer the contest organizers shipped, kept under
+``reference/`` because it is **not** part of the alpha-submission runtime
+path. It is reachable only when the user explicitly passes ``--llm`` to
+``dcp_optimizer.py``; alpha submissions use the deterministic dispatcher
+in :mod:`optimizer.dispatcher` instead. We keep this code around for
+study and possible future reuse, since pieces of it (tool-calling loop,
+token accounting, system-prompt structure) may inform later experiments.
 """
 
 import asyncio
@@ -23,7 +25,7 @@ from typing import Optional
 
 from openai import OpenAI
 
-from .base import DCPOptimizerBase, DEFAULT_MODEL, parse_timing_summary_static
+from optimizer.base import DCPOptimizerBase, DEFAULT_MODEL, parse_timing_summary_static
 
 logger = logging.getLogger(__name__)
 
