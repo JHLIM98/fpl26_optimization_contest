@@ -31,9 +31,8 @@ logger = logging.getLogger(__name__)
 
 
 def load_system_prompt() -> str:
-    """Load system prompt from SYSTEM_PROMPT.TXT file (project root)."""
-    package_dir = Path(__file__).parent.resolve()
-    prompt_file = package_dir.parent / "SYSTEM_PROMPT.TXT"
+    """Load SYSTEM_PROMPT.TXT colocated with this reference module."""
+    prompt_file = Path(__file__).parent.resolve() / "SYSTEM_PROMPT.TXT"
 
     try:
         with open(prompt_file, 'r') as f:
